@@ -142,7 +142,12 @@ export const componentTypeSchema = z.enum([
 export type ComponentType = z.infer<typeof componentTypeSchema>
 
 /** Valid target paths for profile files (flat structure, no .opencode/ prefix) */
-export const profileTargetPathSchema = z.enum(["ocx.jsonc", "opencode.jsonc", "AGENTS.md"])
+export const profileTargetPathSchema = z.enum([
+	"ocx.jsonc",
+	"opencode.jsonc",
+	"AGENTS.md",
+	"oh-my-opencode.json",
+])
 
 export type ProfileTargetPath = z.infer<typeof profileTargetPathSchema>
 
@@ -650,7 +655,7 @@ export function validateFileTarget(target: string, componentType?: ComponentType
 		if (!isProfileFile && !isOpencodeTarget) {
 			throw new ValidationError(
 				`Invalid profile target: "${target}". ` +
-					`Must be a profile file (ocx.jsonc, opencode.jsonc, AGENTS.md) or start with ".opencode/"`,
+					`Must be a profile file (ocx.jsonc, opencode.jsonc, AGENTS.md, oh-my-opencode.json) or start with ".opencode/"`,
 			)
 		}
 

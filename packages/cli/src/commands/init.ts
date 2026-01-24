@@ -384,6 +384,14 @@ async function fetchAndExtractTemplate(
 	}
 }
 
+/** Convert string to title case (e.g., "my-registry" → "My Registry") */
+function toTitleCase(str: string): string {
+	return str
+		.split(/[-_\s]+/)
+		.map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+		.join(" ")
+}
+
 async function replacePlaceholders(
 	dir: string,
 	values: { namespace: string; author: string },
@@ -404,6 +412,7 @@ async function replacePlaceholders(
 
 		// Replace placeholders
 		content = content.replace(/my-registry/g, values.namespace)
+		content = content.replace(/My Registry/g, toTitleCase(values.namespace))
 		content = content.replace(/Your Name/g, values.author)
 
 		await writeFile(filePath, content)

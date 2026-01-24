@@ -74,7 +74,12 @@ export interface ProfileLock {
 // =============================================================================
 
 /** Valid profile file targets (flat, no .opencode/ prefix) */
-const PROFILE_FILE_TARGETS = new Set(["ocx.jsonc", "opencode.jsonc", "AGENTS.md"])
+const PROFILE_FILE_TARGETS = new Set([
+	"ocx.jsonc",
+	"opencode.jsonc",
+	"AGENTS.md",
+	"oh-my-opencode.json",
+])
 
 /**
  * Check if a file target is a profile file (goes flat in profile dir)
