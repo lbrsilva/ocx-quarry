@@ -1,5 +1,5 @@
 {
-	"name": "my-registry",
+	"name": "kit",
 	"private": true,
 	"scripts": {
 		"build": "bunx ocx build . --out dist",

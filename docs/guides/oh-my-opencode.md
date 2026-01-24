@@ -4,90 +4,71 @@ Set up [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) with OCX
 
 > **Prerequisites:** [OCX installed](../CLI.md#installation) and [global profiles initialized](../PROFILES.md)
 
-## Overview
+## Quick Start
 
-```
-~/.config/opencode/profiles/omo/
-├── ocx.jsonc              # Visibility control (what OpenCode sees)
-├── opencode.jsonc         # Plugin + provider configuration
-├── oh-my-opencode.json    # Agent/category/skill definitions
-└── AGENTS.md              # Your custom instructions
-```
-
-## Quick Setup
-
-### 1. Create a profile
+### 1. Add the kit registry (one-time)
 
 ```bash
-ocx init --global           # One-time setup
-ocx profile add omo
+ocx registry add https://ocx-kit.kdco.dev --name kit --global
 ```
 
-### 2. Install oh-my-opencode
+### 2. Install the omo profile
 
 ```bash
-bunx oh-my-opencode install
+ocx profile add omo --from kit/omo
 ```
 
-This runs an interactive setup that configures your providers and creates the config files.
-
-### 3. Launch with your profile
+### 3. Launch
 
 ```bash
 ocx oc -p omo
 ```
 
-## Configuration Files
+That's it! The profile comes pre-configured with free OpenCodeZen models.
 
-### opencode.jsonc
+## What's Included
 
-Plugin and provider settings:
+The `omo` profile includes:
 
-```jsonc
-{
-  "plugin": ["oh-my-opencode@latest"],
-  "provider": {
-    "anthropic": {
-      "name": "Anthropic",
-      "options": { "apiKey": "env:ANTHROPIC_API_KEY" }
-    }
-  }
-}
+| File | Purpose |
+|------|---------|
+| `opencode.jsonc` | Default models + oh-my-opencode plugin |
+| `oh-my-opencode.json` | Agent configurations with free models |
+| `ocx.jsonc` | Profile isolation settings |
+| `AGENTS.md` | Quick reference |
+
+**Pre-configured models:**
+- **Big Pickle** → Orchestrator (Sisyphus), Executor (Atlas)
+- **GPT-5 Nano** → Research, exploration, documentation, planning
+
+## Customize Models
+
+Edit your profile's oh-my-opencode config:
+
+```bash
+# View available models
+opencode models
+
+# Edit the config
+$EDITOR ~/.config/opencode/profiles/omo/oh-my-opencode.json
 ```
 
-### oh-my-opencode.json
-
-Agent, category, and skill definitions. Add the schema for autocomplete:
-
-```jsonc
-{
-  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-opencode/master/assets/oh-my-opencode.schema.json",
-  "agents": { ... },
-  "categories": { ... },
-  "skills": { ... }
-}
-```
-
-| Section      | Purpose                              | Docs                                                                                                                     |
-| ------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `agents`     | Override model/behavior per agent    | [Agents Guide](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/features.md)                                 |
-| `categories` | Domain presets (visual, quick, etc.) | [Category System](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/category-skill-guide.md#2-category-system) |
-| `skills`     | Knowledge modules + MCP servers      | [Skill System](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/category-skill-guide.md#3-skill-system)       |
+See the [oh-my-opencode configuration docs](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/configurations.md) for all options.
 
 ## Tips
 
-**Set a default profile:**
+**Set as default profile:**
 ```bash
 export OCX_PROFILE=omo  # Add to ~/.zshrc or ~/.bashrc
 ```
 
 **Clone for variations:**
 ```bash
-ocx profile add personal --from omo
+ocx profile add work --from omo
 ```
 
 **For untrusted repos**, see [Lock Down Recipe](../PROFILES.md#lock-down-recipe).
 
 ---
 
-For full configuration options, see the [oh-my-opencode documentation](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/configurations.md).
+For manual setup or advanced configuration, see the [oh-my-opencode documentation](https://github.com/code-yeongyu/oh-my-opencode/blob/dev/docs/configurations.md).

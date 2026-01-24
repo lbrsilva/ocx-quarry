@@ -1,0 +1,19 @@
+{
+	"$schema": "https://ocx.kdco.dev/schemas/registry.json",
+	"namespace": "kit",
+	"author": "KDCO",
+	"components": [
+		{
+			"name": "omo",
+			"type": "ocx:profile",
+			"description": "Oh-My-OpenCode starter profile with free models",
+			"files": [
+				{ "path": "profiles/omo/ocx.jsonc", "target": "ocx.jsonc" },
+				{ "path": "profiles/omo/opencode.jsonc", "target": "opencode.jsonc" },
+				{ "path": "profiles/omo/oh-my-opencode.json", "target": "oh-my-opencode.json" },
+				{ "path": "profiles/omo/AGENTS.md", "target": "AGENTS.md" }
+			],
+			"dependencies": []
+		}
+	]
+}
