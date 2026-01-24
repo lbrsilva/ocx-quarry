@@ -245,8 +245,8 @@ describe("ocx self uninstall (missing paths)", () => {
 	it("exits 0 with 'Nothing to remove' when no global config exists", async () => {
 		// Don't create any config structure
 
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
@@ -260,8 +260,8 @@ describe("ocx self uninstall (missing paths)", () => {
 		writeFileSync(join(profilesDir, "ocx.jsonc"), "{}")
 		// Note: no ocx.jsonc at root level
 
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
@@ -276,8 +276,8 @@ describe("ocx self uninstall (missing paths)", () => {
 		writeFileSync(ocxConfig, JSON.stringify({ registries: {} }))
 		// Note: no profiles/ directory
 
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
@@ -293,8 +293,8 @@ describe("ocx self uninstall (missing paths)", () => {
 		// Precondition
 		expect(existsSync(root)).toBe(true)
 
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
@@ -447,8 +447,8 @@ describe("ocx self uninstall (output messages)", () => {
 	})
 
 	it("verifies 'Nothing to remove' message format", async () => {
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
@@ -459,8 +459,8 @@ describe("ocx self uninstall (output messages)", () => {
 	it("verifies success message format for removed files", async () => {
 		createMockGlobalConfig(testDir)
 
-		const { exitCode, output } = await runCLI(["self", "uninstall"], testDir, {
-			env: { XDG_CONFIG_HOME: testDir },
+		const { exitCode, output } = await runCLIIsolated(["self", "uninstall"], testDir, {
+			XDG_CONFIG_HOME: testDir,
 		})
 
 		expect(exitCode).toBe(0)
