@@ -8,6 +8,7 @@
 import { isAbsolute, normalize } from "node:path"
 import { z } from "zod"
 import { ValidationError } from "../utils/errors"
+import { PathValidationError, validatePath } from "../utils/path-security"
 
 // =============================================================================
 // NPM SPECIFIER SCHEMA
@@ -141,15 +142,8 @@ export const componentTypeSchema = z.enum([
 
 export type ComponentType = z.infer<typeof componentTypeSchema>
 
-/** Valid target paths for profile files (flat structure, no .opencode/ prefix) */
-export const profileTargetPathSchema = z.enum([
-	"ocx.jsonc",
-	"opencode.jsonc",
-	"AGENTS.md",
-	"oh-my-opencode.json",
-])
-
-export type ProfileTargetPath = z.infer<typeof profileTargetPathSchema>
+/** Reserved targets for profiles (installer-owned files) */
+const PROFILE_RESERVED_TARGETS = new Set(["ocx.lock", ".opencode"])
 
 /**
  * Target path must be inside .opencode/ with valid subdirectory
@@ -648,26 +642,22 @@ export function validateFileTarget(target: string, componentType?: ComponentType
 	const isProfile = componentType === "ocx:profile"
 
 	if (isProfile) {
-		// Profiles allow flat profile files OR .opencode/... for embedded dependencies
-		const isProfileFile = profileTargetPathSchema.safeParse(target).success
-		const isOpencodeTarget = target.startsWith(".opencode/")
-
-		if (!isProfileFile && !isOpencodeTarget) {
-			throw new ValidationError(
-				`Invalid profile target: "${target}". ` +
-					`Must be a profile file (ocx.jsonc, opencode.jsonc, AGENTS.md, oh-my-opencode.json) or start with ".opencode/"`,
-			)
+		// Check reserved names
+		if (PROFILE_RESERVED_TARGETS.has(target)) {
+			throw new ValidationError(`Target "${target}" is reserved for installer use`)
 		}
 
-		// If .opencode target, validate the subdirectory
-		if (isOpencodeTarget) {
-			const parseResult = targetPathSchema.safeParse(target)
-			if (!parseResult.success) {
-				throw new ValidationError(
-					`Invalid embedded target: "${target}". ${parseResult.error.errors[0]?.message}`,
-				)
+		// Validate path safety using battle-tested validation
+		try {
+			validatePath("/dummy/base", target) // Just validates the path structure
+		} catch (error) {
+			if (error instanceof PathValidationError) {
+				throw new ValidationError(`Invalid profile target "${target}": ${error.message}`)
 			}
+			throw error
 		}
+
+		return // No further restrictions for profiles - trust the user
 	} else {
 		// Non-profile types require .opencode/... paths
 		const parseResult = targetPathSchema.safeParse(target)

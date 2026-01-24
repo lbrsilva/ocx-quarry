@@ -70,25 +70,6 @@ export interface ProfileLock {
 }
 
 // =============================================================================
-// PROFILE FILE TARGETS (flat in profile dir, not in .opencode/)
-// =============================================================================
-
-/** Valid profile file targets (flat, no .opencode/ prefix) */
-const PROFILE_FILE_TARGETS = new Set([
-	"ocx.jsonc",
-	"opencode.jsonc",
-	"AGENTS.md",
-	"oh-my-opencode.json",
-])
-
-/**
- * Check if a file target is a profile file (goes flat in profile dir)
- */
-function isProfileFile(target: string): boolean {
-	return PROFILE_FILE_TARGETS.has(target)
-}
-
-// =============================================================================
 // HASHING UTILITIES
 // =============================================================================
 
@@ -202,7 +183,7 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 	filesSpin?.start()
 
 	const profileFiles: { path: string; target: string; content: Buffer }[] = []
-	const dependencyFiles: { path: string; target: string; content: Buffer }[] = []
+	const embeddedFiles: { path: string; target: string; content: Buffer }[] = []
 
 	for (const file of normalized.files) {
 		const content = await fetchFileContent(registryUrl, component, file.path)
@@ -212,11 +193,11 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 			content: Buffer.from(content),
 		}
 
-		// Route files: profile files go flat, others go to .opencode/
-		if (isProfileFile(file.target)) {
-			profileFiles.push(fileEntry)
+		// Route files: .opencode/ prefix goes to subdir, everything else goes flat
+		if (file.target.startsWith(".opencode/")) {
+			embeddedFiles.push(fileEntry)
 		} else {
-			dependencyFiles.push(fileEntry)
+			profileFiles.push(fileEntry)
 		}
 	}
 
@@ -312,7 +293,7 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 		}
 
 		// Also write any embedded dependency files from the profile manifest
-		for (const file of dependencyFiles) {
+		for (const file of embeddedFiles) {
 			// Embedded files go to .opencode/ in profile
 			// Strip .opencode/ prefix if present to prevent double-nesting
 			const target = file.target.startsWith(".opencode/")
@@ -328,7 +309,7 @@ export async function installProfileFromRegistry(options: InstallProfileOptions)
 			await writeFile(targetPath, file.content)
 		}
 
-		writeSpin?.succeed(`Wrote ${profileFiles.length + dependencyFiles.length} profile files`)
+		writeSpin?.succeed(`Wrote ${profileFiles.length + embeddedFiles.length} profile files`)
 
 		// ==========================================================================
 		// Phase 6: Write dependency component files (to .opencode/ in staging)
