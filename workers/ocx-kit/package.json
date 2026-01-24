@@ -2,11 +2,12 @@
 	"name": "kit",
 	"private": true,
 	"scripts": {
-		"build": "bunx ocx build . --out dist",
+		"build": "bun scripts/build.ts",
 		"deploy": "bun run build && wrangler deploy",
 		"dev": "bun run build && wrangler dev"
 	},
 	"devDependencies": {
+		"ocx": "workspace:*",
 		"wrangler": "^4.54.0"
 	}
 }
