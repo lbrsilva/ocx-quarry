@@ -15,6 +15,8 @@ Your OpenCode config, anywhere.
 
 ![OCX Profiles Demo](./assets/profiles-demo.gif)
 
+*Demo uses [oh-my-opencode](./docs/guides/oh-my-opencode.md). See [more guides](./docs/guides/).*
+
 ## Installation
 
 OCX supports macOS (x64, Apple Silicon), Linux (x64, arm64), and Windows (x64).
