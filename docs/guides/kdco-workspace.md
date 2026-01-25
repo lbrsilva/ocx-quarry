@@ -72,6 +72,11 @@ ocx profile add work --from ws
 
 **For untrusted repos**, see [Lock Down Recipe](../PROFILES.md#lock-down-recipe).
 
+## Troubleshooting
+
+**Terminal hangs on first run?**
+Close the terminal and rerun `ocx oc -p ws`. This can happen during initial dependency installation.
+
 ---
 
 For architecture details, agent boundaries, and component documentation, see the [Workspace README](../../facades/opencode-workspace/README.md).
