@@ -18,21 +18,6 @@ describe("parseFromOption()", () => {
 		expect(result).toEqual({ type: "registry", namespace: "kdco", component: "minimal" })
 	})
 
-	it("parses local path starting with ./", () => {
-		const result = parseFromOption("./path/to/profile")
-		expect(result).toEqual({ type: "local-path", path: "./path/to/profile" })
-	})
-
-	it("parses local path starting with ~/", () => {
-		const result = parseFromOption("~/my-profile")
-		expect(result).toEqual({ type: "local-path", path: "~/my-profile" })
-	})
-
-	it("parses absolute path starting with /", () => {
-		const result = parseFromOption("/absolute/path")
-		expect(result).toEqual({ type: "local-path", path: "/absolute/path" })
-	})
-
 	it("parses local profile name (no slash)", () => {
 		const result = parseFromOption("my-profile")
 		expect(result).toEqual({ type: "local-profile", name: "my-profile" })
@@ -288,10 +273,10 @@ describe("ocx profile add (conflict detection)", () => {
 		expect(exitCode).toBe(6)
 		// Verify error message contains key information for user action
 		expect(output).toContain("already exists")
-		expect(output).toContain("--force")
+		expect(output).toContain("ocx profile rm existing-profile")
 	})
 
-	it("overwrites existing profile with --force", async () => {
+	it("allows adding profile after explicit removal", async () => {
 		// Setup global config
 		const globalConfigDir = join(testDir, "opencode")
 		const profilesDir = join(globalConfigDir, "profiles")
@@ -316,8 +301,12 @@ describe("ocx profile add (conflict detection)", () => {
 		const workDir = join(testDir, "workspace")
 		await mkdir(workDir, { recursive: true })
 
-		// Overwrite with --force
-		const { exitCode } = await runCLI(["profile", "add", "existing-profile", "--force"], workDir)
+		// First remove the profile
+		const { exitCode: rmExitCode } = await runCLI(["profile", "rm", "existing-profile"], workDir)
+		expect(rmExitCode).toBe(0)
+
+		// Then add the profile fresh
+		const { exitCode } = await runCLI(["profile", "add", "existing-profile"], workDir)
 
 		expect(exitCode).toBe(0)
 
@@ -510,55 +499,6 @@ describe("ocx profile add --from (local profile cloning)", () => {
 })
 
 // =============================================================================
-// INTEGRATION TESTS: Local Path Installation (Not Yet Implemented)
-// =============================================================================
-
-describe("ocx profile add --from (local path - not implemented)", () => {
-	let testDir: string
-	const originalXdgConfigHome = process.env.XDG_CONFIG_HOME
-
-	beforeEach(async () => {
-		testDir = await createTempDir("profile-local-path")
-		process.env.XDG_CONFIG_HOME = testDir
-	})
-
-	afterEach(async () => {
-		if (originalXdgConfigHome === undefined) {
-			delete process.env.XDG_CONFIG_HOME
-		} else {
-			process.env.XDG_CONFIG_HOME = originalXdgConfigHome
-		}
-		if (testDir) {
-			await cleanupTempDir(testDir)
-		}
-	})
-
-	it("shows clear error for local path installation (not yet implemented)", async () => {
-		// Setup global config
-		const globalConfigDir = join(testDir, "opencode")
-		const profilesDir = join(globalConfigDir, "profiles")
-		await mkdir(profilesDir, { recursive: true })
-		await writeFile(join(globalConfigDir, "ocx.jsonc"), JSON.stringify({ registries: {} }, null, 2))
-
-		// Create default profile
-		await mkdir(join(profilesDir, "default"), { recursive: true })
-		await writeFile(join(profilesDir, "default", "ocx.jsonc"), "{}")
-
-		const workDir = join(testDir, "workspace")
-		await mkdir(workDir, { recursive: true })
-
-		// Try to install from local path
-		const { exitCode, output } = await runCLI(
-			["profile", "add", "local-profile", "--from", "./my-local-profile"],
-			workDir,
-		)
-
-		expect(exitCode).not.toBe(0)
-		expect(output).toContain("not yet implemented")
-	})
-})
-
-// =============================================================================
 // INTEGRATION TESTS: Registry Profile Installation (Happy Path)
 // =============================================================================
 
@@ -632,6 +572,61 @@ describe("ocx profile add --from (registry installation)", () => {
 		}
 		expect(lockContent.installedFrom.registry).toBe("kdco")
 		expect(lockContent.installedFrom.component).toBe("test-profile")
+	})
+
+	it("should install profile dependencies flat (not in .opencode/)", async () => {
+		// Setup global config with registry configured
+		const globalConfigDir = join(testDir, "opencode")
+		const profilesDir = join(globalConfigDir, "profiles")
+		await mkdir(profilesDir, { recursive: true })
+		await writeFile(
+			join(globalConfigDir, "ocx.jsonc"),
+			JSON.stringify({ registries: { kdco: { url: registry.url } } }, null, 2),
+		)
+
+		// Create default profile (required for initialization)
+		await mkdir(join(profilesDir, "default"), { recursive: true })
+		await writeFile(join(profilesDir, "default", "ocx.jsonc"), "{}")
+
+		const workDir = join(testDir, "workspace")
+		await mkdir(workDir, { recursive: true })
+
+		// Install profile with dependencies from registry
+		const { exitCode, output } = await runCLI(
+			["profile", "add", "test-with-deps", "--from", "kdco/test-profile-with-deps"],
+			workDir,
+		)
+
+		if (exitCode !== 0) {
+			console.log("Output:", output)
+		}
+		expect(exitCode).toBe(0)
+
+		const profileDir = join(profilesDir, "test-with-deps")
+
+		// Verify profile files exist at root
+		expect(existsSync(join(profileDir, "ocx.jsonc"))).toBe(true)
+		expect(existsSync(join(profileDir, "opencode.jsonc"))).toBe(true)
+		expect(existsSync(join(profileDir, "AGENTS.md"))).toBe(true)
+
+		// Verify dependency files are FLAT (at profile root, not in .opencode/)
+		expect(existsSync(join(profileDir, "plugin", "test-plugin.ts"))).toBe(true)
+
+		// Verify NO .opencode/ directory exists - this is the key regression check
+		expect(existsSync(join(profileDir, ".opencode"))).toBe(false)
+
+		// Verify lockfile contains both installedFrom and installed entries
+		const lockPath = join(profileDir, "ocx.lock")
+		expect(existsSync(lockPath)).toBe(true)
+		const lockContent = parseJsonc(await readFile(lockPath, "utf-8")) as {
+			lockVersion: number
+			installedFrom: { registry: string; component: string }
+			installed: Record<string, unknown>
+		}
+		expect(lockContent.lockVersion).toBe(1)
+		expect(lockContent.installedFrom.registry).toBe("kdco")
+		expect(lockContent.installedFrom.component).toBe("test-profile-with-deps")
+		expect(lockContent.installed["kdco/test-plugin"]).toBeDefined()
 	})
 })
 
