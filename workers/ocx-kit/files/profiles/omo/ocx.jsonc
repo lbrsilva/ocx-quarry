@@ -1,5 +1,5 @@
 {
-	"$schema": "https://ocx.kdco.dev/schemas/ocx.json",
+	"$schema": "https://ocx.kdco.dev/schemas/profile.json",
 	"registries": {},
 	"renameWindow": true,
 	"exclude": [
