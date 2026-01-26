@@ -385,7 +385,7 @@ Use profile commands to manage multiple configurations:
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `ocx opencode [path]` | `ocx oc` | Launch OpenCode with config |
+| `ocx opencode` | `ocx oc` | Launch OpenCode with config |
 | `ocx opencode -p <name>` | `ocx oc -p` | Launch with specific profile |
 
 #### Init Commands

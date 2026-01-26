@@ -241,9 +241,11 @@ ocx config edit -p work
 
 | Command | Description |
 |---------|-------------|
-| `ocx opencode [path]` | Launch OpenCode with config |
-| `ocx oc [path]` | Alias for `opencode` |
+| `ocx opencode` | Launch OpenCode with config |
+| `ocx oc` | Alias for `opencode` |
 | `ocx opencode -p <name>` | Launch with specific profile |
+
+**Note:** The `ocx oc` command runs from the current working directory. Only `-p`/`--profile` and `--no-rename` are OCX-specific flags. Everything else passes through to OpenCode. Use `--` only if you need to pass conflicting tags to opencode itself (rare).
 
 **Examples:**
 
@@ -409,13 +411,16 @@ ocx opencode  # Automatically uses work profile
 
 ```bash
 # Work on client project
-OCX_PROFILE=client-x ocx opencode ~/projects/client-app
+cd ~/projects/client-app
+OCX_PROFILE=client-x ocx opencode
 
 # Switch to personal project
-OCX_PROFILE=default ocx opencode ~/projects/my-side-project
+cd ~/projects/my-side-project
+OCX_PROFILE=default ocx opencode
 
 # Contribute to open source (locked down)
-OCX_PROFILE=untrusted ocx opencode ~/projects/external-repo
+cd ~/projects/external-repo
+OCX_PROFILE=untrusted ocx opencode
 ```
 
 ### Profile Cloning

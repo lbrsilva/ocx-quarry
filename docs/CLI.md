@@ -1356,21 +1356,22 @@ Launch OpenCode with resolved configuration and profile support.
 ### Usage
 
 ```bash
-ocx opencode [path] [options]
-ocx oc [path] [options]  # alias
+ocx opencode [options]
+ocx oc [options]  # alias
 ```
 
 ### Arguments
 
-| Argument | Description |
-|----------|-------------|
-| `path` | Project path (optional, defaults to current directory) |
+This command does not take arguments. It always runs from the current working directory.
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
 | `-p, --profile <name>` | Use specific global profile |
+| `--no-rename` | Skip automatic window/terminal renaming |
+
+**Note:** Only `-p`/`--profile` and `--no-rename` are OCX flags. All other arguments and flags pass through to OpenCode. Use `--` to pass flags that conflict with OCX (e.g., `ocx oc -- --help` forwards help to opencode).
 
 ### Profile Resolution Priority
 
@@ -1390,14 +1391,18 @@ ocx opencode
 # Launch with specific profile
 ocx opencode -p work
 
-# Launch in different directory
-ocx opencode /path/to/project
+# Skip automatic window renaming
+ocx opencode --no-rename
 
 # Using environment variable
 OCX_PROFILE=work ocx opencode
 
 # Using alias
 ocx oc -p personal
+
+# Pass flags directly to OpenCode (use -- before OpenCode flags)
+# Example: Get help for OpenCode itself
+ocx oc -- --help
 ```
 
 ### How It Works
