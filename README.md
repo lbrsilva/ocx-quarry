@@ -42,6 +42,7 @@ ocx profile add work        # Create a work profile
 
 # Install pre-configured profile (optional)
 ocx registry add https://ocx-kit.kdco.dev --name kit --global
+ocx registry add https://registry.kdco.dev --name kdco --global
 ocx profile add ws --from kit/ws
 
 # Use in any repo
