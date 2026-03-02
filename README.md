@@ -9,13 +9,13 @@ Your OpenCode config, anywhere.
 
 ## Why OCX?
 
-- 👻 **Profiles** — Work in any repo with YOUR config. Control exactly what OpenCode sees.
-- 📦 **Registries** — npm plugins, MCP servers, components from curated registries.
-- 🔒 **Auditable** — SHA-256 verified, version-pinned, code you own.
+- 📁 **Profiles** — Work in any repo with YOUR config. Control exactly what OpenCode sees.
+- 📦 **Registries** — Install profiles and components from curated registries.
+- 🔒 **Auditable** — SHA-verified, code you own.
 
 ![OCX Profiles Demo](./assets/profiles-demo.gif)
 
-*Demo uses [oh-my-opencode](./docs/guides/oh-my-opencode.md). See [more guides](./docs/guides/).*
+*Demo uses [oh-my-opencode](https://ocx.kdco.dev/guides/oh-my-opencode). See [more guides](https://ocx.kdco.dev/guides/index).*
 
 ## Installation
 
@@ -31,94 +31,105 @@ npm install -g ocx
 
 The install script handles PATH configuration automatically or prints instructions if manual setup is needed.
 
-## Quick Start: Profiles
+## Quick Start
 
 Work in any repo without modifying it. Your config, their code.
 
 ```bash
 # One-time setup
-ocx init --global           # Initialize global profiles
-ocx profile add work        # Create a work profile
+ocx init --global
 
-# Install pre-configured profile (optional)
-ocx registry add https://ocx-kit.kdco.dev --name kit --global
-ocx profile add work --from kit/omo
+# Install the KDCO workspace profile (OpenCode Free Models Only)
+ocx profile add ws --source tweak/p-1vp4xoqv --from https://tweakoc.com/r --global
 
-# Use in any repo
-cd ~/oss/some-project
-ocx oc -p work              # Launch OpenCode with your work profile
-
-# Or set default
-export OCX_PROFILE=work
-ocx oc                      # Uses work profile automatically
+# Launch OpenCode with the profile
+ocx oc -p ws
 ```
 
-Profile settings control what OpenCode sees through `exclude`/`include` patterns. Registries are isolated per profile for security. OpenCode config merges safely between profile and local settings.
+Need a custom profile? Open the KDCO Workspace harness in TweakOC: https://tweakoc.com/h/kdco-workspace
 
-> **Security Note:** By default, profiles include project `AGENTS.md` files. For untrusted repos, uncomment `**/AGENTS.md` in your profile's exclude list. See [Lock Down Recipe](./docs/PROFILES.md#lock-down-recipe).
+Profiles control what OpenCode sees through `exclude`/`include` patterns. Each profile has isolated registries for security. OpenCode config merges safely between profile and local settings.
 
-**[Full Profile Guide →](./docs/PROFILES.md)**
+> **Security Note:** An empty exclude list includes all project instruction files; the default profile template ships a secure exclude list. For trusted repos, edit your profile to loosen the template's exclude list. See [Lock Down Recipe](https://ocx.kdco.dev/profiles/security#lock-down-recipe).
 
-## Quick Start: Components
+**[Profile Deep Dive →](https://ocx.kdco.dev/profiles/overview)**
 
-Add components to local projects with automatic dependency resolution.
-
-![OCX Components Demo](./assets/components-demo.gif)
-
-```bash
-# Initialize local config
-ocx init
-
-# Add a registry
-ocx registry add https://registry.kdco.dev --name kdco
-
-# Install components
-ocx add kdco/workspace
-
-# Or install npm plugins directly
-ocx add npm:@franlol/opencode-md-table-formatter
-```
-
-After installation, components live in `.opencode/` where you can customize freely. OCX handles npm dependencies, MCP servers, and config merging automatically.
-
-## Philosophy
-
-OCX follows the **ShadCN model**: components are copied into your project (`.opencode/`), not hidden in `node_modules`. You own the code—customize freely.
-
-Like **Cargo**, OCX resolves dependencies, pins versions, and verifies integrity. Every component is SHA-256 verified and version-pinned. See changes before updating:
-
-```bash
-ocx diff kdco/workspace
-```
-
-*Your AI agent never runs code you haven't reviewed.*
-
-## Commands
+## Common Commands
 
 | Command | Description |
 |---------|-------------|
-| `ocx add <component>` | Add components or npm plugins (`npm:package`) |
-| `ocx update [component]` | Update to latest version |
-| `ocx diff [component]` | Show upstream changes before updating |
-| `ocx profile <cmd>` | Manage global profiles (`add`, `list`, `remove`, `show`) |
-| `ocx opencode` / `ocx oc` | Launch OpenCode with profile |
-| `ocx registry add <url>` | Add a component registry (`--global` for global, `-p` for profile) |
-| `ocx config show` | View config from current scope |
-| `ocx config edit` | Edit local or global config (`--global`) |
-| `ocx self update` | Update OCX to latest version |
-| `ocx self uninstall` | Remove OCX config and binary |
+| `ocx profile add <name> --source <registry/profile> --from <url> --global` | Install a profile from a registry |
+| `ocx profile add <name> --clone <existing> --global` | Clone an existing profile |
+| `ocx oc -p <name>` | Launch OpenCode with a profile |
+| `ocx profile list --global` | List your profiles |
+| `ocx config edit --global` | Edit your global config |
+| `ocx migrate` | Dry-run preview of v1.4.6 → v2 migration (shows what would change, no writes) |
+| `ocx migrate --apply` | Apply migration to receipt format |
+| `ocx migrate --global` | Dry-run preview of global root + all profiles migration |
+| `ocx migrate --global --apply` | Apply migration across global root and profiles |
 
-**[Full CLI Reference →](./docs/CLI.md)**
+**[Full CLI Reference →](https://ocx.kdco.dev/cli/commands)**
 
-## Creating Registries
+## Advanced Usage
 
-Scaffold a complete registry with one-click deploy support:
+### Components
+
+Add individual components to projects (copied to `.opencode/`, not `node_modules`):
+
+```bash
+# One-time local setup
+ocx init
+
+# Add a registry with a name
+ocx registry add https://registry.kdco.dev --name kdco
+
+# Install components using name/component syntax
+ocx add kdco/workspace
+```
+
+See [Components & Registries](https://ocx.kdco.dev/registries/create) for more.
+
+### Upgrading from v1.4.6
+
+If you have an existing v1.4.6 project, migrate to the receipt format (`.ocx/receipt.jsonc`):
+
+```bash
+ocx migrate          # Dry-run: shows what would be migrated (no files written)
+ocx migrate --apply  # Apply migration
+ocx verify           # Confirm integrity post-migration
+```
+
+For global config migration (migrates global root and all profiles):
+
+```bash
+ocx migrate --global          # Preview migration across global root + all profiles
+ocx migrate --global --apply  # Apply migration to global root and every profile
+```
+
+### Creating Registries
+
+Scaffold and deploy your own registry:
 
 ```bash
 npx ocx init --registry my-registry
 ```
 
-This creates a complete registry template with deploy buttons for Cloudflare, Vercel, and Netlify.
+See [Creating Registries](https://ocx.kdco.dev/registries/create) for details.
+
+## Philosophy
+
+OCX follows the **ShadCN model**: components are copied into your project (`.opencode/`), not hidden in `node_modules`. You own the code—customize freely.
+
+Like **Cargo**, OCX resolves dependencies and verifies integrity. Every component is SHA-256 verified.
+
+*Your AI agent never runs code you haven't reviewed.*
+
+## Documentation
+
+- **[Profiles](https://ocx.kdco.dev/profiles/overview)** — Deep dive into profile configuration and isolation
+- **[CLI Reference](https://ocx.kdco.dev/cli/commands)** — Complete command documentation
+- **[Creating Registries](https://ocx.kdco.dev/registries/create)** — Build and distribute your own components
+- **[Guides](https://ocx.kdco.dev/guides/index)** — Step-by-step tutorials
 
 ## Disclaimer
 

@@ -15,15 +15,20 @@ export {
 	type OcxLock,
 	ocxConfigSchema,
 	ocxLockSchema,
+	// Receipt types (V2)
+	type Receipt,
 	// Types
 	type RegistryConfig,
 	// I/O helpers
 	readOcxConfig,
 	readOcxLock,
+	readReceipt,
+	receiptSchema,
 	// Schemas
 	registryConfigSchema,
 	writeOcxConfig,
 	writeOcxLock,
+	writeReceipt,
 } from "./config"
 
 // OCX profile schemas
@@ -33,6 +38,7 @@ export { type ProfileOcxConfig, profileOcxConfigSchema } from "./ocx"
 export {
 	type AgentConfig,
 	agentConfigSchema,
+	aliasSchema,
 	type ComponentFile,
 	type ComponentFileObject,
 	type ComponentManifest,

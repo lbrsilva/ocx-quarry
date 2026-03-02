@@ -1,0 +1,275 @@
+---
+title: "ocx profile"
+description: "Reference for the ocx profile command — manage global profiles"
+---
+
+## Usage
+
+```bash
+ocx profile <subcommand> [options]
+ocx p <subcommand> [options]  # alias
+```
+
+## Description
+
+Manage global profiles for different OpenCode configurations. Profiles give you portable, isolated configurations that work across repositories.
+
+## Subcommands
+
+- [`ocx profile list`](#profile-list) — List all global profiles
+- [`ocx profile add`](#profile-add) — Create new profile or install from registry
+- [`ocx profile remove`](#profile-remove) — Delete a profile
+- [`ocx profile move`](#profile-move) — Rename a profile
+- [`ocx profile show`](#profile-show) — Display profile contents
+
+---
+
+## Profile List
+
+List all available global profiles.
+
+### Usage
+
+```bash
+ocx profile list --global [options]
+ocx p ls --global [options]  # alias
+```
+
+### Flags
+
+| Flag | Shorthand | Default | Description |
+|------|-----------|---------|-------------|
+| `--global` | `-g` | `true` | List global profiles (required) |
+| `--json` | | `false` | Output as JSON |
+
+### Examples
+
+```bash
+# List all profiles
+ocx profile list --global
+
+# List with JSON output
+ocx p ls --global --json
+```
+
+### Output
+
+```bash
+$ ocx profile list --global
+Global profiles:
+  default
+  work
+  client-x
+
+$ ocx profile list --global --json
+{
+  "profiles": ["default", "work", "client-x"],
+  "initialized": true
+}
+```
+
+---
+
+## Profile Add
+
+Create a new profile, clone from existing, or install from a registry.
+
+### Usage
+
+```bash
+ocx profile add <name> [options]
+ocx p add <name> [options]  # alias
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `name` | Yes | Profile name |
+
+### Flags
+
+| Flag | Shorthand | Default | Description |
+|------|-----------|---------|-------------|
+| `--clone <profile>` | | | Clone from existing profile |
+| `--source <name/component>` | | | Install profile from registry component |
+| `--from <url>` | | | Ephemeral registry URL for profile installation (used with `--source`) |
+| `--global` | `-g` | `true` | Create global profile (required) |
+
+### Examples
+
+```bash
+# Create new empty profile
+ocx profile add work --global
+
+# Clone from existing profile
+ocx profile add client-x --clone work --global
+
+# Install from registry with ephemeral URL (not saved)
+ocx profile add ws --source kit/ws --from https://ocx-kit.kdco.dev --global
+
+# First add global registry, then install profile
+ocx registry add https://ocx-kit.kdco.dev --name kit --global
+ocx profile add ws --source kit/ws --global
+
+# Overwrite existing profile (remove and re-add)
+ocx profile remove ws --global
+ocx profile add ws --source kit/ws --global
+```
+
+### Notes
+
+- Profile names must be valid filesystem names.
+- Spaces are automatically converted to hyphens.
+- `--clone` accepts: existing profile name.
+- `--source` accepts: `registry/component` shorthand for profile components.
+- `--from` (with `--source`) provides ephemeral registry URL without saving to config.
+- To overwrite an existing profile, remove it first with `ocx profile rm <name> --global`, then add again.
+
+---
+
+## Profile Remove
+
+Delete a profile.
+
+### Usage
+
+```bash
+ocx profile remove <name> [options]
+ocx p rm <name> [options]  # alias
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `name` | Yes | Profile name to delete |
+
+### Flags
+
+| Flag | Shorthand | Default | Description |
+|------|-----------|---------|-------------|
+| `--global` | `-g` | `true` | Remove global profile (required) |
+
+### Examples
+
+```bash
+# Remove a profile
+ocx profile remove old-profile --global
+```
+
+### Notes
+
+- Deletion is immediate (Cargo-style, no confirmation prompt).
+- Cannot delete the last remaining profile.
+
+---
+
+## Profile Move
+
+Rename a profile.
+
+### Usage
+
+```bash
+ocx profile move <old-name> <new-name> [options]
+ocx p mv <old-name> <new-name> [options]  # alias
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `old-name` | Yes | Current profile name |
+| `new-name` | Yes | New profile name |
+
+### Flags
+
+| Flag | Shorthand | Default | Description |
+|------|-----------|---------|-------------|
+| `--global` | `-g` | `true` | Move global profile (required) |
+
+### Examples
+
+```bash
+# Rename a profile
+ocx profile move work client-work --global
+```
+
+### Notes
+
+- Profile names must be 1–32 characters, alphanumeric with dots, underscores, hyphens.
+- Cannot rename to a name that already exists (remove target first).
+- Warns if renaming the active profile (update `OCX_PROFILE` env var).
+- Self-rename (same old and new name) is a silent no-op.
+
+### Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Profile "X" not found` | Source profile not found | Check name with `ocx profile list --global` |
+| `Cannot move: profile "Y" already exists` | Target name conflicts | Remove existing profile first |
+
+---
+
+## Profile Show
+
+Display profile configuration and contents.
+
+### Usage
+
+```bash
+ocx profile show [name] --global [options]
+ocx p show [name] --global [options]  # alias
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `name` | No | Profile name (defaults to resolved profile) |
+
+### Flags
+
+| Flag | Shorthand | Default | Description |
+|------|-----------|---------|-------------|
+| `--global` | `-g` | `true` | Show global profile (required) |
+| `--json` | | `false` | Output as JSON |
+
+### Examples
+
+```bash
+# Show current profile (uses resolved profile)
+ocx profile show --global
+
+# Show work profile config
+ocx profile show work --global
+
+# Get JSON output
+ocx p show work --global --json
+```
+
+### Output
+
+```bash
+$ ocx profile show work --global
+Profile: work
+Path: /Users/username/.config/opencode/profiles/work/
+
+Files:
+  ocx.jsonc
+  opencode.jsonc
+  AGENTS.md
+
+Configuration:
+  Registries: kdco
+  Exclude patterns: **/AGENTS.md, **/CLAUDE.md
+  Include patterns: (none)
+```
+
+## See Also
+
+- [Profiles Overview](/profiles/overview) — Core profile concepts and configuration.
+- [Profile Configuration](/profiles/configuration) — Detailed settings reference.
+- [Profile Security](/profiles/security) — Lock down recipes.
+- [ocx opencode](/cli/opencode) — Launch OpenCode with a profile.

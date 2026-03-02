@@ -16,6 +16,7 @@ export interface MockRegistry {
 	setRouteTimeout: (pathPattern: string, delayMs: number) => void
 	setRouteMalformed: (pathPattern: string) => void
 	clearRouteOverrides: () => void
+	clearFileContent: () => void
 }
 
 /**
@@ -28,24 +29,24 @@ export function startMockRegistry(): MockRegistry {
 	const components = {
 		"test-plugin": {
 			name: "test-plugin",
-			type: "ocx:plugin",
+			type: "plugin",
 			description: "A test plugin",
-			files: [{ path: "index.ts", target: ".opencode/plugin/test-plugin.ts" }],
+			files: [{ path: "index.ts", target: "plugins/test-plugin.ts" }],
 			dependencies: [],
 			npmDependencies: ["lodash@^4.17.21"],
 		},
 		"test-skill": {
 			name: "test-skill",
-			type: "ocx:skill",
+			type: "skill",
 			description: "A test skill",
-			files: [{ path: "SKILL.md", target: ".opencode/skills/test-skill/SKILL.md" }],
+			files: [{ path: "SKILL.md", target: "skills/test-skill/SKILL.md" }],
 			dependencies: ["test-plugin"],
 		},
 		"test-agent": {
 			name: "test-agent",
-			type: "ocx:agent",
+			type: "agent",
 			description: "A test agent",
-			files: [{ path: "agent.md", target: ".opencode/agent/test-agent.md" }],
+			files: [{ path: "agent.md", target: "agents/test-agent.md" }],
 			dependencies: ["test-skill"],
 			opencode: {
 				mcp: {
@@ -56,10 +57,57 @@ export function startMockRegistry(): MockRegistry {
 				},
 			},
 		},
+		"test-command": {
+			name: "test-command",
+			type: "command",
+			description: "A test command",
+			files: [{ path: "COMMAND.md", target: "commands/test-command.md" }],
+			dependencies: [],
+		},
+		"test-command-singular": {
+			name: "test-command-singular",
+			type: "command",
+			description: "A test command with singular target",
+			files: [{ path: "COMMAND.md", target: "command/test-command-singular.md" }],
+			dependencies: [],
+		},
+		"collision-command-a": {
+			name: "collision-command-a",
+			type: "command",
+			description: "First command that collides after adaptive root resolution",
+			files: [{ path: "A.md", target: "command/shared-collision.md" }],
+			dependencies: [],
+		},
+		"collision-command-b": {
+			name: "collision-command-b",
+			type: "command",
+			description: "Second command that collides after adaptive root resolution",
+			files: [{ path: "B.md", target: "commands/shared-collision.md" }],
+			dependencies: [],
+		},
+		"collision-parent": {
+			name: "collision-parent",
+			type: "bundle",
+			description: "Parent component that pulls colliding dependencies",
+			files: [],
+			dependencies: ["collision-command-a", "collision-command-b"],
+		},
+		researcher: {
+			name: "researcher",
+			type: "agent",
+			description: "Researcher fixture for strict JSON tests",
+			files: [{ path: "agent.md", target: "agents/researcher.md" }],
+			dependencies: [],
+			opencode: {
+				tools: {
+					"research-tool": true,
+				},
+			},
+		},
 		// Profile component for testing profile installation
 		"test-profile": {
 			name: "test-profile",
-			type: "ocx:profile",
+			type: "profile",
 			description: "A test profile for registry installation",
 			files: [
 				{ path: "ocx.jsonc", target: "ocx.jsonc" },
@@ -71,7 +119,7 @@ export function startMockRegistry(): MockRegistry {
 		// Profile with dependencies for testing flat installation
 		"test-profile-with-deps": {
 			name: "test-profile-with-deps",
-			type: "ocx:profile",
+			type: "profile",
 			description: "Test profile with dependencies for regression testing",
 			files: [
 				{ path: "ocx.jsonc", target: "ocx.jsonc" },
@@ -80,12 +128,49 @@ export function startMockRegistry(): MockRegistry {
 			],
 			dependencies: ["test-plugin"],
 		},
+		"test-profile-with-command-deps": {
+			name: "test-profile-with-command-deps",
+			type: "profile",
+			description: "Test profile with command dependency for adaptive root resolution",
+			files: [
+				{ path: "ocx.jsonc", target: "ocx.jsonc" },
+				{ path: "opencode.jsonc", target: "opencode.jsonc" },
+				{ path: "AGENTS.md", target: "AGENTS.md" },
+				{ path: "keep", target: "command/.keep" },
+			],
+			dependencies: ["test-command-singular"],
+		},
+		"test-profile-with-file-collision": {
+			name: "test-profile-with-file-collision",
+			type: "profile",
+			description: "Profile with colliding file targets after adaptive root resolution",
+			files: [
+				{ path: "ocx.jsonc", target: "ocx.jsonc" },
+				{ path: "opencode.jsonc", target: "opencode.jsonc" },
+				{ path: "AGENTS.md", target: "AGENTS.md" },
+				{ path: "alpha.md", target: "command/shared-profile-collision.md" },
+				{ path: "beta.md", target: "commands/shared-profile-collision.md" },
+			],
+			dependencies: [],
+		},
+		"test-profile-malicious-embedded": {
+			name: "test-profile-malicious-embedded",
+			type: "profile",
+			description: "Profile with malicious embedded traversal target",
+			files: [
+				{ path: "ocx.jsonc", target: "ocx.jsonc" },
+				{ path: "opencode.jsonc", target: "opencode.jsonc" },
+				{ path: "AGENTS.md", target: "AGENTS.md" },
+				{ path: "evil.txt", target: ".opencode/../victim.txt" },
+			],
+			dependencies: [],
+		},
 		// Components for testing MCP merge regression
 		"test-mcp-provider": {
 			name: "test-mcp-provider",
-			type: "ocx:plugin",
+			type: "plugin",
 			description: "A component that provides MCP servers",
-			files: [{ path: "index.ts", target: ".opencode/plugin/test-mcp-provider.ts" }],
+			files: [{ path: "index.ts", target: "plugins/test-mcp-provider.ts" }],
 			dependencies: [],
 			opencode: {
 				mcp: {
@@ -100,9 +185,9 @@ export function startMockRegistry(): MockRegistry {
 		// Component with string command shorthand MCP
 		"test-local-mcp": {
 			name: "test-local-mcp",
-			type: "ocx:plugin",
+			type: "plugin",
 			description: "A component with local MCP using string command",
-			files: [{ path: "index.ts", target: ".opencode/plugin/test-local-mcp.ts" }],
+			files: [{ path: "index.ts", target: "plugins/test-local-mcp.ts" }],
 			dependencies: [],
 			opencode: {
 				mcp: {
@@ -115,9 +200,9 @@ export function startMockRegistry(): MockRegistry {
 		},
 		"test-no-mcp": {
 			name: "test-no-mcp",
-			type: "ocx:plugin",
+			type: "plugin",
 			description: "A component without MCP that depends on test-mcp-provider",
-			files: [{ path: "index.ts", target: ".opencode/plugin/test-no-mcp.ts" }],
+			files: [{ path: "index.ts", target: "plugins/test-no-mcp.ts" }],
 			dependencies: ["test-mcp-provider"],
 			opencode: {
 				tools: {
@@ -155,8 +240,8 @@ export function startMockRegistry(): MockRegistry {
 
 			if (path === "/index.json") {
 				return Response.json({
+					$schema: "https://ocx.kdco.dev/schemas/v2/registry.json",
 					name: "Test Registry",
-					namespace: "kdco",
 					version: "1.0.0",
 					author: "Test Author",
 					components: Object.values(components).map((c) => ({
@@ -205,13 +290,32 @@ export function startMockRegistry(): MockRegistry {
 				}
 				if (name === "test-profile-with-deps") {
 					if (filePath === "ocx.jsonc") {
-						return new Response(JSON.stringify({ registries: {} }, null, 2))
+						// Use req.url to get the base URL dynamically
+						const baseUrl = `http://${url.host}`
+						return new Response(JSON.stringify({ registries: { kdco: { url: baseUrl } } }, null, 2))
 					}
 					if (filePath === "opencode.jsonc") {
 						return new Response(JSON.stringify({}, null, 2))
 					}
 					if (filePath === "AGENTS.md") {
 						return new Response("# Test Profile With Deps\n\nTest profile with dependencies.")
+					}
+				}
+				if (name === "test-profile-with-command-deps") {
+					if (filePath === "ocx.jsonc") {
+						const baseUrl = `http://${url.host}`
+						return new Response(JSON.stringify({ registries: { kdco: { url: baseUrl } } }, null, 2))
+					}
+					if (filePath === "opencode.jsonc") {
+						return new Response(JSON.stringify({}, null, 2))
+					}
+					if (filePath === "AGENTS.md") {
+						return new Response(
+							"# Test Profile With Command Deps\n\nTest profile with command deps.",
+						)
+					}
+					if (filePath === "keep") {
+						return new Response("keep")
 					}
 				}
 				return new Response(`Content of ${filePath} for ${name}`)
@@ -239,6 +343,9 @@ export function startMockRegistry(): MockRegistry {
 		},
 		clearRouteOverrides: () => {
 			routeOverrides.clear()
+		},
+		clearFileContent: () => {
+			customFiles.clear()
 		},
 	}
 }

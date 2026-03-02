@@ -4,6 +4,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { cleanupTempDir, createTempDir, runCLI } from "./helpers"
 
+const REGISTRY_SCHEMA_V2_URL = "https://ocx.kdco.dev/schemas/v2/registry.json"
+
 describe("ocx build", () => {
 	let testDir: string
 
@@ -21,6 +23,7 @@ describe("ocx build", () => {
 		await mkdir(sourceDir, { recursive: true })
 
 		const registryJson = {
+			$schema: REGISTRY_SCHEMA_V2_URL,
 			name: "Test Registry",
 			namespace: "kdco",
 			version: "1.0.0",
@@ -28,16 +31,16 @@ describe("ocx build", () => {
 			components: [
 				{
 					name: "comp-1",
-					type: "ocx:plugin",
+					type: "plugin", // V2: No ocx: prefix
 					description: "Test component 1",
-					files: [{ path: "index.ts", target: ".opencode/plugin/comp-1.ts" }],
+					files: [{ path: "index.ts", target: "plugins/comp-1.ts" }], // V2: root-relative
 					dependencies: [],
 				},
 				{
 					name: "comp-2",
-					type: "ocx:agent",
+					type: "agent", // V2: No ocx: prefix
 					description: "Test component 2",
-					files: [{ path: "agent.md", target: ".opencode/agent/comp-2.md" }],
+					files: [{ path: "agent.md", target: "agents/comp-2.md" }], // V2: root-relative
 					dependencies: ["comp-1"],
 				},
 			],
@@ -86,6 +89,7 @@ describe("ocx build", () => {
 		await mkdir(sourceDir, { recursive: true })
 
 		const registryJson = {
+			$schema: REGISTRY_SCHEMA_V2_URL,
 			name: "Invalid Registry",
 			namespace: "kdco",
 			version: "1.0.0",
@@ -93,9 +97,9 @@ describe("ocx build", () => {
 			components: [
 				{
 					name: "INVALID_NAME",
-					type: "ocx:plugin",
+					type: "plugin", // V2: No ocx: prefix
 					description: "Invalid component",
-					files: [{ path: "index.ts", target: ".opencode/plugin/invalid.ts" }],
+					files: [{ path: "index.ts", target: "plugins/invalid.ts" }], // V2: root-relative
 					dependencies: [],
 				},
 			],
@@ -115,6 +119,7 @@ describe("ocx build", () => {
 		await mkdir(sourceDir, { recursive: true })
 
 		const registryJson = {
+			$schema: REGISTRY_SCHEMA_V2_URL,
 			name: "Missing Dep Registry",
 			namespace: "kdco",
 			version: "1.0.0",
@@ -122,9 +127,9 @@ describe("ocx build", () => {
 			components: [
 				{
 					name: "comp",
-					type: "ocx:plugin",
+					type: "plugin", // V2: No ocx: prefix
 					description: "Component with missing dep",
-					files: [{ path: "index.ts", target: ".opencode/plugin/comp.ts" }],
+					files: [{ path: "index.ts", target: "plugins/comp.ts" }], // V2: root-relative
 					dependencies: ["non-existent"],
 				},
 			],
@@ -148,6 +153,7 @@ describe("ocx build", () => {
 		// JSONC content with inline and block comments
 		const registryJsonc = `{
 	// This is an inline comment
+	"$schema": "${REGISTRY_SCHEMA_V2_URL}",
 	"name": "JSONC Registry",
 	"namespace": "test",
 	"version": "1.0.0",
@@ -158,9 +164,9 @@ describe("ocx build", () => {
 	"components": [
 		{
 			"name": "jsonc-comp",
-			"type": "ocx:plugin",
+			"type": "plugin",
 			"description": "Component from JSONC", // trailing comment
-			"files": [{ "path": "index.ts", "target": ".opencode/plugin/jsonc-comp.ts" }],
+			"files": [{ "path": "index.ts", "target": "plugins/jsonc-comp.ts" }],
 			"dependencies": [],
 		}
 	],
@@ -199,6 +205,7 @@ describe("ocx build", () => {
 
 		// Create registry.json with one name
 		const registryJson = {
+			$schema: REGISTRY_SCHEMA_V2_URL,
 			name: "JSON Registry",
 			namespace: "test",
 			version: "1.0.0",
@@ -206,9 +213,9 @@ describe("ocx build", () => {
 			components: [
 				{
 					name: "from-json",
-					type: "ocx:plugin",
+					type: "plugin", // V2: No ocx: prefix
 					description: "Component from JSON",
-					files: [{ path: "index.ts", target: ".opencode/plugin/from-json.ts" }],
+					files: [{ path: "index.ts", target: "plugins/from-json.ts" }], // V2: root-relative
 					dependencies: [],
 				},
 			],
@@ -217,6 +224,7 @@ describe("ocx build", () => {
 		// Create registry.jsonc with a different name
 		const registryJsonc = `{
 	// JSONC should be preferred
+	"$schema": "${REGISTRY_SCHEMA_V2_URL}",
 	"name": "JSONC Registry Preferred",
 	"namespace": "test",
 	"version": "1.0.0",
@@ -224,9 +232,9 @@ describe("ocx build", () => {
 	"components": [
 		{
 			"name": "from-jsonc",
-			"type": "ocx:plugin",
+			"type": "plugin",
 			"description": "Component from JSONC",
-			"files": [{ "path": "index.ts", "target": ".opencode/plugin/from-jsonc.ts" }],
+			"files": [{ "path": "index.ts", "target": "plugins/from-jsonc.ts" }],
 			"dependencies": [],
 		}
 	]
@@ -254,5 +262,92 @@ describe("ocx build", () => {
 		const index = JSON.parse(await readFile(join(fullOutDir, "index.json"), "utf-8"))
 		expect(index.name).toBe("JSONC Registry Preferred")
 		expect(index.components[0].name).toBe("from-jsonc")
+	})
+
+	it("should fail when schema URL is missing (legacy v1)", async () => {
+		const sourceDir = join(testDir, "registry-missing-schema")
+		await mkdir(sourceDir, { recursive: true })
+
+		const registryJson = {
+			name: "Missing Schema Registry",
+			namespace: "test",
+			version: "1.0.0",
+			author: "Test Author",
+			components: [],
+		}
+
+		await writeFile(join(sourceDir, "registry.json"), JSON.stringify(registryJson, null, 2))
+
+		const { exitCode, output } = await runCLI(["build", "registry-missing-schema"], testDir)
+
+		expect(exitCode).not.toBe(0)
+		expect(output).toContain("legacy-schema-v1")
+		expect(output).toContain("v2")
+	})
+
+	it("should fail when schema major is unsupported", async () => {
+		const sourceDir = join(testDir, "registry-unsupported-schema")
+		await mkdir(sourceDir, { recursive: true })
+
+		const registryJson = {
+			$schema: "https://ocx.kdco.dev/schemas/v3/registry.json",
+			name: "Unsupported Schema Registry",
+			namespace: "test",
+			version: "1.0.0",
+			author: "Test Author",
+			components: [],
+		}
+
+		await writeFile(join(sourceDir, "registry.json"), JSON.stringify(registryJson, null, 2))
+
+		const { exitCode, output } = await runCLI(["build", "registry-unsupported-schema"], testDir)
+
+		expect(exitCode).not.toBe(0)
+		expect(output).toContain("unsupported-schema-version")
+		expect(output).toContain("v2")
+	})
+
+	it("should fail when schema URL is non-canonical", async () => {
+		const sourceDir = join(testDir, "registry-invalid-schema")
+		await mkdir(sourceDir, { recursive: true })
+
+		const registryJson = {
+			$schema: "https://example.com/registry.json",
+			name: "Invalid Schema URL Registry",
+			namespace: "test",
+			version: "1.0.0",
+			author: "Test Author",
+			components: [],
+		}
+
+		await writeFile(join(sourceDir, "registry.json"), JSON.stringify(registryJson, null, 2))
+
+		const { exitCode, output } = await runCLI(["build", "registry-invalid-schema"], testDir)
+
+		expect(exitCode).not.toBe(0)
+		expect(output).toContain("invalid-schema-url")
+		expect(output).toContain(REGISTRY_SCHEMA_V2_URL)
+	})
+
+	it("should fail when schema URL includes explicit default HTTPS port (:443)", async () => {
+		const sourceDir = join(testDir, "registry-invalid-schema-443")
+		await mkdir(sourceDir, { recursive: true })
+
+		const registryJson = {
+			$schema: "https://ocx.kdco.dev:443/schemas/v2/registry.json",
+			name: "Invalid Schema URL Port Registry",
+			namespace: "test",
+			version: "1.0.0",
+			author: "Test Author",
+			components: [],
+		}
+
+		await writeFile(join(sourceDir, "registry.json"), JSON.stringify(registryJson, null, 2))
+
+		const { exitCode, output } = await runCLI(["build", "registry-invalid-schema-443"], testDir)
+
+		expect(exitCode).not.toBe(0)
+		expect(output).toContain("invalid-schema-url")
+		expect(output).toContain(REGISTRY_SCHEMA_V2_URL)
 	})
 })

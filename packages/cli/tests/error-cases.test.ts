@@ -56,6 +56,16 @@ describe("Error Cases", () => {
 	})
 
 	describe("invalid inputs", () => {
+		let registry: MockRegistry
+
+		beforeEach(async () => {
+			registry = await startMockRegistry()
+		})
+
+		afterEach(() => {
+			registry.stop()
+		})
+
 		it("should error on invalid registry URL", async () => {
 			await runCLI(["init"], testDir)
 			const result = await runCLI(["registry", "add", "not-a-valid-url", "--name", "test"], testDir)
@@ -63,17 +73,28 @@ describe("Error Cases", () => {
 			expect(result.stderr).toContain("Invalid registry URL")
 		})
 
-		it("should error on duplicate registry name without --force", async () => {
+		it("should succeed idempotently for same name + same URL (no conflict)", async () => {
 			await runCLI(["init"], testDir)
-			// Add first registry
-			await runCLI(["registry", "add", "https://example.com", "--name", "test"], testDir)
-			// Try to add duplicate
-			const result = await runCLI(
-				["registry", "add", "https://other.com", "--name", "test"],
-				testDir,
-			)
-			expect(result.exitCode).toBe(6) // CONFLICT error
-			expect(result.stderr).toContain("already exists")
+			// Add first registry (V2: use namespace kdco)
+			await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
+			// Re-add same name + same URL => idempotent success
+			const result = await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
+			expect(result.exitCode).toBe(0)
+		})
+
+		it("should error on duplicate registry name with different URL", async () => {
+			await runCLI(["init"], testDir)
+			await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
+			// Start a second mock registry for a different URL
+			const { startMockRegistry: start2 } = await import("./mock-registry")
+			const registry2 = start2()
+			try {
+				const result = await runCLI(["registry", "add", registry2.url, "--name", "kdco"], testDir)
+				expect(result.exitCode).toBe(6) // CONFLICT error
+				expect(result.stderr).toContain("already exists")
+			} finally {
+				registry2.stop()
+			}
 		})
 
 		it("should error when adding to locked registries", async () => {
@@ -83,10 +104,7 @@ describe("Error Cases", () => {
 			const config = { registries: {}, lockRegistries: true }
 			await Bun.write(configPath, JSON.stringify(config, null, 2))
 
-			const result = await runCLI(
-				["registry", "add", "https://example.com", "--name", "test"],
-				testDir,
-			)
+			const result = await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
 			expect(result.exitCode).toBe(1) // VALIDATION/GENERAL error
 			expect(result.stderr).toContain("Registries are locked")
 		})
@@ -104,7 +122,7 @@ describe("Error Cases", () => {
 			const globalDir = await mkdtemp(join(tmpdir(), "ocx-global-"))
 			try {
 				await runCLI(["init", "--global"], testDir, { env: { XDG_CONFIG_HOME: globalDir } })
-				const result = await runCLI(["profile", "show", "nonexistent"], testDir, {
+				const result = await runCLI(["profile", "show", "nonexistent", "--global"], testDir, {
 					env: { XDG_CONFIG_HOME: globalDir },
 				})
 				expect(result.exitCode).toBe(66) // NOT_FOUND error
@@ -163,13 +181,27 @@ describe("Error Cases", () => {
 
 	// Phase 5: JSON Error Output Tests
 	describe("JSON error output", () => {
+		let registry: MockRegistry
+
+		beforeEach(async () => {
+			registry = await startMockRegistry()
+		})
+
+		afterEach(() => {
+			registry.stop()
+		})
+
 		it("should output valid JSON for NOT_FOUND error", async () => {
 			const globalDir = await mkdtemp(join(tmpdir(), "ocx-global-"))
 			try {
 				await runCLI(["init", "--global"], testDir, { env: { XDG_CONFIG_HOME: globalDir } })
-				const result = await runCLI(["profile", "show", "nonexistent", "--json"], testDir, {
-					env: { XDG_CONFIG_HOME: globalDir },
-				})
+				const result = await runCLI(
+					["profile", "show", "nonexistent", "--global", "--json"],
+					testDir,
+					{
+						env: { XDG_CONFIG_HOME: globalDir },
+					},
+				)
 				expect(result.exitCode).toBe(66)
 				const json = expectJsonError(result.stdout, {
 					code: "NOT_FOUND",
@@ -183,17 +215,25 @@ describe("Error Cases", () => {
 
 		it("should output valid JSON for CONFLICT error", async () => {
 			await runCLI(["init"], testDir)
-			await runCLI(["registry", "add", "https://example.com", "--name", "test"], testDir)
-			const result = await runCLI(
-				["registry", "add", "https://other.com", "--name", "test", "--json"],
-				testDir,
-			)
-			expect(result.exitCode).toBe(6)
-			const json = expectJsonError(result.stdout, {
-				code: "CONFLICT",
-				exitCode: 6,
-			})
-			expect(json.error.details).toHaveProperty("registryName", "test")
+			await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
+			// Use a different mock registry to trigger actual name conflict
+			const { startMockRegistry: start2 } = await import("./mock-registry")
+			const registry2 = start2()
+			try {
+				const result = await runCLI(
+					["registry", "add", registry2.url, "--name", "kdco", "--json"],
+					testDir,
+				)
+				expect(result.exitCode).toBe(6)
+				const json = expectJsonError(result.stdout, {
+					code: "CONFLICT",
+					exitCode: 6,
+				})
+				expect(json.error.details).toHaveProperty("registryName", "kdco")
+				expect(json.error.details).toHaveProperty("conflictType", "name")
+			} finally {
+				registry2.stop()
+			}
 		})
 
 		it("should output valid JSON for VALIDATION_ERROR", async () => {
@@ -232,7 +272,7 @@ describe("Error Cases", () => {
 		it("should error when registry schema is invalid", async () => {
 			// Create registry.jsonc with invalid schema (missing required fields)
 			const registryConfig = {
-				$schema: "https://ocx.build/registry.json",
+				$schema: "https://ocx.kdco.dev/schemas/v2/registry.json",
 				name: "test",
 				// Missing namespace, version, author, and components - which are required
 			}
@@ -246,7 +286,7 @@ describe("Error Cases", () => {
 		it("should error when source files are missing", async () => {
 			// Create a complete valid registry.jsonc referencing non-existent files
 			const registryConfig = {
-				$schema: "https://ocx.build/registry.json",
+				$schema: "https://ocx.kdco.dev/schemas/v2/registry.json",
 				name: "test",
 				namespace: "test",
 				version: "1.0.0",
@@ -254,9 +294,9 @@ describe("Error Cases", () => {
 				components: [
 					{
 						name: "missing-component",
-						type: "ocx:agent",
+						type: "agent", // V2: No ocx: prefix
 						description: "A test component with missing files",
-						files: [{ path: "nonexistent.ts", target: ".opencode/agent/nonexistent.ts" }],
+						files: [{ path: "nonexistent.ts", target: "agents/nonexistent.ts" }], // V2: root-relative
 					},
 				],
 			}

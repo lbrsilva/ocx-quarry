@@ -15,6 +15,7 @@ import {
 	OCXError,
 	ProfileExistsError,
 	ProfileNotFoundError,
+	RegistryCompatibilityError,
 	RegistryExistsError,
 } from "../../src/utils/errors"
 import { handleError, wrapAction } from "../../src/utils/handle-error"
@@ -173,7 +174,7 @@ describe("handleError JSON output", () => {
 	}
 
 	describe("RegistryExistsError", () => {
-		it("formats with all details", () => {
+		it("formats name conflict with all details", () => {
 			const error = new RegistryExistsError(
 				"my-registry",
 				"https://old.example.com",
@@ -191,6 +192,7 @@ describe("handleError JSON output", () => {
 			expect(output.success).toBe(false)
 			expect(output.error.code).toBe("CONFLICT")
 			expect(output.error.details).toEqual({
+				conflictType: "name",
 				registryName: "my-registry",
 				existingUrl: "https://old.example.com",
 				newUrl: "https://new.example.com",
@@ -198,6 +200,32 @@ describe("handleError JSON output", () => {
 			})
 			expect(output.exitCode).toBe(EXIT_CODES.CONFLICT)
 			expect(capturedExitCode).toBe(EXIT_CODES.CONFLICT)
+		})
+
+		it("formats URL conflict with existingName", () => {
+			const error = new RegistryExistsError(
+				"new-alias",
+				"https://same.example.com",
+				"https://same.example.com",
+				"local config",
+				"old-alias",
+			)
+
+			try {
+				handleError(error, { json: true })
+			} catch {
+				// Expected
+			}
+
+			const output = parseJsonOutput()
+			expect(output.error.details).toEqual({
+				conflictType: "url",
+				registryName: "new-alias",
+				existingUrl: "https://same.example.com",
+				newUrl: "https://same.example.com",
+				targetLabel: "local config",
+				existingName: "old-alias",
+			})
 		})
 
 		it("formats without optional targetLabel", () => {
@@ -215,11 +243,13 @@ describe("handleError JSON output", () => {
 
 			const output = parseJsonOutput()
 			expect(output.error.details).toEqual({
+				conflictType: "name",
 				registryName: "my-registry",
 				existingUrl: "https://old.example.com",
 				newUrl: "https://new.example.com",
 			})
 			expect(output.error.details).not.toHaveProperty("targetLabel")
+			expect(output.error.details).not.toHaveProperty("existingName")
 		})
 	})
 
@@ -496,7 +526,7 @@ describe("handleError JSON output", () => {
 			try {
 				handleError(error, { json: true })
 			} catch {
-				// Expected
+				// Expected process.exit
 			}
 
 			const output = parseJsonOutput()
@@ -506,6 +536,102 @@ describe("handleError JSON output", () => {
 			// Verify it's a valid ISO date string
 			const parsed = new Date(output.meta.timestamp)
 			expect(parsed.toISOString()).toBe(output.meta.timestamp)
+		})
+	})
+
+	describe("RegistryCompatibilityError", () => {
+		it("formats with url, issue, and remediation details", () => {
+			const error = new RegistryCompatibilityError("Registry uses legacy format", {
+				url: "https://old-registry.example.com/index.json",
+				issue: "legacy-schema-v1",
+				remediation: "Migrate to the OCX registry specification.",
+			})
+
+			try {
+				handleError(error, { json: true })
+			} catch {
+				// Expected process.exit
+			}
+
+			const output = parseJsonOutput()
+			expect(output.success).toBe(false)
+			expect(output.error.code).toBe("REGISTRY_COMPAT_ERROR")
+			expect(output.error.details).toEqual({
+				url: "https://old-registry.example.com/index.json",
+				issue: "legacy-schema-v1",
+				remediation: "Migrate to the OCX registry specification.",
+			})
+			expect(output.exitCode).toBe(EXIT_CODES.CONFIG)
+			expect(capturedExitCode).toBe(EXIT_CODES.CONFIG)
+		})
+
+		it("formats invalid-schema-url issue", () => {
+			const error = new RegistryCompatibilityError("Registry uses invalid schema URL", {
+				url: "https://incomplete.example.com/index.json",
+				issue: "invalid-schema-url",
+				remediation: "Use canonical v2 schema URL.",
+			})
+
+			try {
+				handleError(error, { json: true })
+			} catch {
+				// Expected
+			}
+
+			const output = parseJsonOutput()
+			expect(output.error.code).toBe("REGISTRY_COMPAT_ERROR")
+			expect(output.error.details).toEqual({
+				url: "https://incomplete.example.com/index.json",
+				issue: "invalid-schema-url",
+				remediation: "Use canonical v2 schema URL.",
+			})
+		})
+
+		it("formats schema compatibility details for unsupported major", () => {
+			const error = new RegistryCompatibilityError("Registry uses unsupported schema major", {
+				url: "https://future.example.com/index.json",
+				issue: "unsupported-schema-version",
+				remediation: "Use canonical v2 schema URL.",
+				schemaUrl: "https://ocx.kdco.dev/schemas/v3/registry.json",
+				supportedMajor: 2,
+				detectedMajor: 3,
+			})
+
+			try {
+				handleError(error, { json: true })
+			} catch {
+				// Expected
+			}
+
+			const output = parseJsonOutput()
+			expect(output.error.code).toBe("REGISTRY_COMPAT_ERROR")
+			expect(output.error.details).toEqual({
+				url: "https://future.example.com/index.json",
+				issue: "unsupported-schema-version",
+				remediation: "Use canonical v2 schema URL.",
+				schemaUrl: "https://ocx.kdco.dev/schemas/v3/registry.json",
+				supportedMajor: 2,
+				detectedMajor: 3,
+			})
+		})
+
+		it("formats invalid-format issue", () => {
+			const error = new RegistryCompatibilityError("Registry returned unrecognized format", {
+				url: "https://bad.example.com/index.json",
+				issue: "invalid-format",
+				remediation: "Ensure it follows the OCX registry specification.",
+			})
+
+			try {
+				handleError(error, { json: true })
+			} catch {
+				// Expected
+			}
+
+			const output = parseJsonOutput()
+			expect(output.error.code).toBe("REGISTRY_COMPAT_ERROR")
+			expect(output.error.details?.issue).toBe("invalid-format")
+			expect(output.meta.timestamp).toBeDefined()
 		})
 	})
 })

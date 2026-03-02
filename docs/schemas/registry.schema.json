@@ -1,10 +1,10 @@
 {
-	"$id": "https://ocx.kdco.dev/registry.schema.json",
+	"$id": "https://ocx.kdco.dev/schemas/v2/registry.json",
 	"$schema": "http://json-schema.org/draft-07/schema#",
 	"title": "OCX Registry Schema",
 	"description": "Schema for registry.jsonc files that define OCX component registries",
 	"type": "object",
-	"required": ["name", "namespace", "version", "author", "components"],
+	"required": ["name", "version", "author", "components"],
 	"additionalProperties": false,
 	"properties": {
 		"$schema": {
@@ -15,13 +15,6 @@
 			"type": "string",
 			"minLength": 1,
 			"description": "Human-readable registry name"
-		},
-		"namespace": {
-			"type": "string",
-			"minLength": 1,
-			"maxLength": 64,
-			"pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
-			"description": "Registry namespace identifier (lowercase alphanumeric with hyphens)"
 		},
 		"version": {
 			"type": "string",
@@ -66,7 +59,7 @@
 				},
 				"type": {
 					"type": "string",
-					"enum": ["ocx:agent", "ocx:skill", "ocx:plugin", "ocx:command", "ocx:tool", "ocx:bundle"],
+					"enum": ["agent", "skill", "plugin", "command", "tool", "bundle", "profile"],
 					"description": "Component type"
 				},
 				"description": {
@@ -83,7 +76,7 @@
 							{
 								"type": "string",
 								"minLength": 1,
-								"description": "Source path (target auto-inferred as .opencode/<path>)"
+								"description": "Source path (target auto-inferred to the same root-relative path)"
 							},
 							{
 								"type": "object",
@@ -97,8 +90,8 @@
 									},
 									"target": {
 										"type": "string",
-										"pattern": "^\\.opencode/(agent|skill|plugin|command|tool|philosophy)/",
-										"description": "Target path in project (must start with .opencode/{agent|skill|plugin|command|tool|philosophy}/)"
+										"pattern": "^(agent|agents|skill|skills|plugin|plugins|command|commands|tool|tools|bundle|bundles|profile|profiles)/",
+										"description": "Root-relative target path (no .opencode/ prefix). Must start with a canonical V2 root segment (singular or plural): agent(s), skill(s), plugin(s), command(s), tool(s), bundle(s), or profile(s)."
 									}
 								}
 							}

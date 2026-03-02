@@ -50,7 +50,15 @@ import { z } from "zod"
 
 const ComponentSchema = z.object({
   name: z.string(),
-  type: z.enum(["ocx:skill", "ocx:plugin", "ocx:agent", "ocx:bundle"]),
+  type: z.enum([
+    "skill",
+    "plugin",
+    "agent",
+    "command",
+    "tool",
+    "bundle",
+    "profile"
+  ]),
 })
 
 // Parse once at the boundary
@@ -112,9 +120,9 @@ kit/
 │   ├── skills/
 │   │   └── my-skill/
 │   │       └── SKILL.md
-│   ├── plugin/
+│   ├── plugins/
 │   │   └── my-plugin.ts
-│   └── agent/
+│   └── agents/
 │       └── my-agent.md
 ├── dist/                   # Built output (generated)
 │   ├── index.json          # Registry index
@@ -130,7 +138,7 @@ The registry manifest defines your components:
 
 ```json
 {
-  "$schema": "https://ocx.kdco.dev/schema.json",
+  "$schema": "https://ocx.kdco.dev/schemas/v2/registry.json",
   "name": "My Registry",
   "namespace": "my-namespace",
   "version": "0.0.1",
@@ -138,7 +146,7 @@ The registry manifest defines your components:
   "components": [
     {
       "name": "my-skill",
-      "type": "ocx:skill",
+      "type": "skill",
       "description": "A helpful skill",
       "files": ["skills/my-skill/SKILL.md"]
     }
@@ -154,13 +162,15 @@ OCX supports the following component types:
 
 | Type | Purpose | File Format |
 |------|---------|-------------|
-| `ocx:skill` | Instructions for AI behavior | Markdown (SKILL.md) |
-| `ocx:plugin` | Code that extends OpenCode | TypeScript |
-| `ocx:agent` | Agent role definitions | Markdown |
-| `ocx:bundle` | Collection of components | JSON manifest |
-| `ocx:profile` | Shareable profile configuration | JSON |
+| `skill` | Instructions for AI behavior | Markdown (SKILL.md) |
+| `plugin` | Code that extends OpenCode | TypeScript |
+| `agent` | Agent role definitions | Markdown |
+| `command` | Custom TUI commands | Markdown |
+| `tool` | Custom tool implementations | TypeScript |
+| `bundle` | Collection of components | JSON manifest |
+| `profile` | Shareable profile configuration | JSON |
 
-### Skills (ocx:skill)
+### Skills (skill)
 
 Skills teach AI assistants how to perform specific tasks.
 
@@ -203,11 +213,11 @@ Show good and bad examples...
 - Anti-pattern 2
 ```
 
-### Plugins (ocx:plugin)
+### Plugins (plugin)
 
 Plugins add functionality to OpenCode through hooks and tools.
 
-**File:** `files/plugin/{name}.ts`
+**File:** `files/plugins/{name}.ts`
 
 ```typescript
 import type { Plugin, PluginContext, ToolDefinition } from "opencode"
@@ -294,11 +304,11 @@ interface PluginContext {
 }
 ```
 
-### Agents (ocx:agent)
+### Agents (agent)
 
 Agents define specialized AI roles with specific permissions and behaviors.
 
-**File:** `files/agent/{name}.md`
+**File:** `files/agents/{name}.md`
 
 ```markdown
 # Agent: Code Reviewer
@@ -339,14 +349,14 @@ Brief overview of the code quality
 Prioritized list of improvements
 ```
 
-### Bundles (ocx:bundle)
+### Bundles (bundle)
 
 Bundles aggregate multiple components for easy installation.
 
 ```json
 {
   "name": "starter-kit",
-  "type": "ocx:bundle",
+  "type": "bundle",
   "description": "Everything you need to get started",
   "dependencies": [
     "my-skill",
@@ -437,7 +447,7 @@ For advanced control:
   "files": [
     {
       "source": "skills/my-skill/SKILL.md",
-      "target": ".opencode/skills/my-skill.md",
+      "target": "skills/my-skill.md",
       "transform": "minify"
     }
   ]
@@ -462,7 +472,7 @@ Use bare name:
 
 ### External Registry
 
-Use qualified name (namespace/component):
+Use qualified name (registry-name/component):
 
 ```json
 {
@@ -494,7 +504,7 @@ dist/
 ├── skills/
 │   └── my-skill/
 │       └── SKILL.md
-└── plugin/
+└── plugins/
     └── my-plugin.ts
 ```
 
@@ -519,9 +529,9 @@ Push to GitHub and connect to Netlify. The `netlify.toml` handles configuration.
 
 For comprehensive documentation, refer to:
 
-- **OpenCode Reference:** https://raw.githubusercontent.com/kdcokenny/ocx/main/docs/OPENCODE_REFERENCE.md
-- **OCX CLI Documentation:** https://github.com/kdcokenny/ocx
-- **Registry Protocol:** https://raw.githubusercontent.com/kdcokenny/ocx/main/docs/REGISTRY_PROTOCOL.md
+- **OpenCode Reference:** https://ocx.kdco.dev/reference/opencode
+- **OCX CLI Documentation:** https://ocx.kdco.dev/cli/commands
+- **Registry Protocol:** https://ocx.kdco.dev/registries/protocol
 
 ---
 
@@ -565,10 +575,10 @@ mkdir -p files/skills/my-new-skill
 touch files/skills/my-new-skill/SKILL.md
 
 # For a plugin
-touch files/plugin/my-plugin.ts
+touch files/plugins/my-plugin.ts
 
 # For an agent
-touch files/agent/my-agent.md
+touch files/agents/my-agent.md
 ```
 
 ### 2. Update registry.jsonc
@@ -579,7 +589,7 @@ touch files/agent/my-agent.md
     // ... existing components
     {
       "name": "my-new-skill",
-      "type": "ocx:skill",
+      "type": "skill",
       "description": "Description of what it does",
       "files": ["skills/my-new-skill/SKILL.md"]
     }

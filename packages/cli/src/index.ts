@@ -10,15 +10,16 @@ import { Command } from "commander"
 import { registerAddCommand } from "./commands/add"
 import { registerBuildCommand } from "./commands/build"
 import { registerConfigCommand } from "./commands/config/index"
-import { registerDiffCommand } from "./commands/diff"
-import { registerGhostCommand } from "./commands/ghost/index"
 import { registerInitCommand } from "./commands/init"
+import { registerMigrateCommand } from "./commands/migrate/index"
 import { registerOpencodeCommand } from "./commands/opencode"
 import { registerProfileCommand } from "./commands/profile/index"
 import { registerRegistryCommand } from "./commands/registry"
+import { registerRemoveCommand } from "./commands/remove"
 import { registerSearchCommand } from "./commands/search"
 import { registerSelfCommand } from "./commands/self/index"
 import { registerUpdateCommand } from "./commands/update"
+import { registerVerifyCommand } from "./commands/verify"
 import { registerUpdateCheckHook } from "./self-update/index"
 import { handleError } from "./utils/index"
 
@@ -36,19 +37,22 @@ async function main() {
 	registerInitCommand(program)
 	registerAddCommand(program)
 	registerUpdateCommand(program)
-	registerDiffCommand(program)
 	registerSearchCommand(program)
 	registerRegistryCommand(program)
 	registerBuildCommand(program)
 	registerSelfCommand(program)
 
+	// V2: Receipt-based component management
+	registerVerifyCommand(program)
+	registerRemoveCommand(program)
+
+	// Migration
+	registerMigrateCommand(program)
+
 	// New top-level commands (Phase 5)
 	registerProfileCommand(program)
 	registerConfigCommand(program)
 	registerOpencodeCommand(program)
-
-	// Migration command (temporary - remove in next minor version)
-	registerGhostCommand(program)
 
 	// Register update check hook (runs after each command)
 	registerUpdateCheckHook(program)

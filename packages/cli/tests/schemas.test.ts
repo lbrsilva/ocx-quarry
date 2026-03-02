@@ -4,8 +4,10 @@
  */
 
 import { describe, expect, it } from "bun:test"
+import { parseCanonicalId } from "../src/schemas/config"
 import {
 	agentConfigSchema,
+	aliasSchema,
 	createQualifiedComponent,
 	dependencyRefSchema,
 	inferTargetPath,
@@ -16,8 +18,11 @@ import {
 	parseQualifiedComponent,
 	permissionConfigSchema,
 	qualifiedComponentSchema,
+	registrySchema,
 	targetPathSchema,
+	validateFileTarget,
 } from "../src/schemas/registry"
+import { ValidationError } from "../src/utils/errors"
 
 describe("schemas", () => {
 	describe("openCodeNameSchema", () => {
@@ -74,8 +79,16 @@ describe("schemas", () => {
 		})
 	})
 
-	describe("namespaceSchema", () => {
-		it("should follow same rules as openCodeNameSchema", () => {
+	describe("aliasSchema", () => {
+		it("should validate registry alias tokens", () => {
+			expect(() => aliasSchema.parse("kdco")).not.toThrow()
+			expect(() => aliasSchema.parse("my-namespace")).not.toThrow()
+			expect(() => aliasSchema.parse("-invalid")).toThrow()
+		})
+	})
+
+	describe("namespaceSchema (deprecated compat)", () => {
+		it("should still work as backward-compatible alias", () => {
 			expect(() => namespaceSchema.parse("kdco")).not.toThrow()
 			expect(() => namespaceSchema.parse("my-namespace")).not.toThrow()
 			expect(() => namespaceSchema.parse("-invalid")).toThrow()
@@ -83,7 +96,7 @@ describe("schemas", () => {
 	})
 
 	describe("qualifiedComponentSchema", () => {
-		it("should accept valid namespace/component format", () => {
+		it("should accept valid alias/component format", () => {
 			expect(() => qualifiedComponentSchema.parse("kdco/researcher")).not.toThrow()
 			expect(() => qualifiedComponentSchema.parse("my-ns/my-comp")).not.toThrow()
 		})
@@ -92,7 +105,7 @@ describe("schemas", () => {
 			expect(() => qualifiedComponentSchema.parse("researcher")).toThrow()
 		})
 
-		it("should reject invalid namespace part", () => {
+		it("should reject invalid alias part", () => {
 			expect(() => qualifiedComponentSchema.parse("Invalid/component")).toThrow()
 			expect(() => qualifiedComponentSchema.parse("-ns/component")).toThrow()
 		})
@@ -128,27 +141,84 @@ describe("schemas", () => {
 	})
 
 	describe("targetPathSchema", () => {
-		it("should accept valid .opencode paths", () => {
-			expect(() => targetPathSchema.parse(".opencode/agent/test.md")).not.toThrow()
-			expect(() => targetPathSchema.parse(".opencode/plugin/my-plugin.ts")).not.toThrow()
-			expect(() => targetPathSchema.parse(".opencode/skills/test/SKILL.md")).not.toThrow()
+		it("should accept standard OpenCode directory paths", () => {
+			expect(() => targetPathSchema.parse("agents/test.md")).not.toThrow()
+			expect(() => targetPathSchema.parse("plugins/my-plugin.ts")).not.toThrow()
+			expect(() => targetPathSchema.parse("skills/test/SKILL.md")).not.toThrow()
+			expect(() => targetPathSchema.parse("commands/foo.ts")).not.toThrow()
+			expect(() => targetPathSchema.parse("tools/bar.ts")).not.toThrow()
 		})
 
-		it("should accept all valid directories", () => {
-			const validDirs = ["agent", "skills", "plugin", "command", "tool", "philosophy"]
-			for (const dir of validDirs) {
-				expect(() => targetPathSchema.parse(`.opencode/${dir}/file.md`)).not.toThrow()
-			}
+		it("should accept custom directory paths", () => {
+			// Blocklist approach - custom paths are now allowed
+			expect(() => targetPathSchema.parse("prompts/my-prompt.md")).not.toThrow()
+			expect(() => targetPathSchema.parse("templates/foo.ts")).not.toThrow()
+			expect(() => targetPathSchema.parse("src/custom.ts")).not.toThrow()
+			expect(() => targetPathSchema.parse("docs/README.md")).not.toThrow()
 		})
 
-		it("should reject paths not starting with .opencode/", () => {
-			expect(() => targetPathSchema.parse("opencode/agent/test.md")).toThrow()
-			expect(() => targetPathSchema.parse("src/file.ts")).toThrow()
+		it("should reject blocked paths in .ocx/", () => {
+			expect(() => targetPathSchema.parse(".ocx/receipt.jsonc")).toThrow("protected")
+			expect(() => targetPathSchema.parse(".ocx/state.json")).toThrow("protected")
+			expect(() => targetPathSchema.parse(".ocx/anything")).toThrow("protected")
 		})
 
-		it("should reject invalid directory names", () => {
-			expect(() => targetPathSchema.parse(".opencode/invalid/file.md")).toThrow("valid directory")
-			expect(() => targetPathSchema.parse(".opencode/src/file.md")).toThrow()
+		it("should reject ocx.jsonc", () => {
+			expect(() => targetPathSchema.parse("ocx.jsonc")).toThrow("protected")
+		})
+
+		it("should reject package.json", () => {
+			expect(() => targetPathSchema.parse("package.json")).toThrow("protected")
+		})
+
+		it("should reject .git/ paths", () => {
+			expect(() => targetPathSchema.parse(".git/config")).toThrow("protected")
+			expect(() => targetPathSchema.parse(".git/HEAD")).toThrow("protected")
+		})
+
+		it("should reject .env", () => {
+			expect(() => targetPathSchema.parse(".env")).toThrow("protected")
+		})
+
+		it("should reject node_modules/ paths", () => {
+			expect(() => targetPathSchema.parse("node_modules/foo")).toThrow("protected")
+			expect(() => targetPathSchema.parse("node_modules/package/index.js")).toThrow("protected")
+		})
+
+		it("should reject unsafe path patterns", () => {
+			// Schema-level checks: absolute paths and null bytes
+			expect(() => targetPathSchema.parse("/etc/passwd")).toThrow()
+			expect(() => targetPathSchema.parse("C:/Windows/System32")).toThrow()
+			expect(() => targetPathSchema.parse("foo\0bar")).toThrow()
+
+			// Traversal detection is deferred to validateFileTarget()
+			// Schema allows ".." in filenames (e.g., component..v2.ts)
+			expect(targetPathSchema.parse("../etc/passwd")).toBe("../etc/passwd")
+			expect(targetPathSchema.parse("foo/../bar")).toBe("foo/../bar")
+			expect(targetPathSchema.parse("component..v2.ts")).toBe("component..v2.ts")
+		})
+
+		it("should detect path traversal in validateFileTarget", () => {
+			// validateFileTarget() uses validatePath() for proper traversal detection
+			expect(() => validateFileTarget("../etc/passwd")).toThrow(ValidationError)
+			expect(() => validateFileTarget("foo/../../../etc/passwd")).toThrow(ValidationError)
+
+			// Safe paths that normalize within bounds are allowed
+			expect(() => validateFileTarget("foo/../bar")).not.toThrow()
+			expect(() => validateFileTarget("component..v2.ts")).not.toThrow()
+		})
+
+		it("should reject normalized paths that bypass protected prefixes", () => {
+			// RED case: normalized paths that land in blocked prefixes
+			// These should be rejected even though schema-level checks pass
+			expect(() => validateFileTarget("foo/../.git/config")).toThrow(ValidationError)
+			expect(() => validateFileTarget("x/../.ocx/receipt.jsonc")).toThrow(ValidationError)
+			expect(() => validateFileTarget("x/../node_modules/pkg/index.js")).toThrow(ValidationError)
+			expect(() => validateFileTarget("bar/../package.json")).toThrow(ValidationError)
+
+			// GREEN case: safe normalization should still work
+			expect(() => validateFileTarget("foo/../bar")).not.toThrow()
+			expect(() => validateFileTarget("component..v2.ts")).not.toThrow()
 		})
 	})
 
@@ -169,22 +239,26 @@ describe("schemas", () => {
 			)
 		})
 
-		it("should throw for empty namespace", () => {
+		it("should throw for empty alias", () => {
 			expect(() => parseQualifiedComponent("/component")).toThrow(
-				"Both namespace and component are required",
+				"Both alias and component are required",
 			)
 		})
 
 		it("should throw for empty component", () => {
 			expect(() => parseQualifiedComponent("namespace/")).toThrow(
-				"Both namespace and component are required",
+				"Both alias and component are required",
 			)
 		})
 
 		it("should throw for just a slash", () => {
-			expect(() => parseQualifiedComponent("/")).toThrow(
-				"Both namespace and component are required",
-			)
+			expect(() => parseQualifiedComponent("/")).toThrow("Both alias and component are required")
+		})
+
+		it("should throw for multiple slash separators", () => {
+			expect(() => parseQualifiedComponent("a/b/c")).toThrow('Too many "/" separators')
+			expect(() => parseQualifiedComponent("ns/comp/extra")).toThrow('Too many "/" separators')
+			expect(() => parseQualifiedComponent("a/b/c/d")).toThrow('Too many "/" separators')
 		})
 	})
 
@@ -199,30 +273,30 @@ describe("schemas", () => {
 	})
 
 	describe("inferTargetPath", () => {
-		it("should prepend .opencode/ to path", () => {
-			expect(inferTargetPath("plugin/foo.ts")).toBe(".opencode/plugin/foo.ts")
+		it("should return path as-is (root-relative)", () => {
+			expect(inferTargetPath("plugins/foo.ts")).toBe("plugins/foo.ts")
 		})
 
 		it("should handle nested paths", () => {
-			expect(inferTargetPath("skills/test/SKILL.md")).toBe(".opencode/skills/test/SKILL.md")
+			expect(inferTargetPath("skills/test/SKILL.md")).toBe("skills/test/SKILL.md")
 		})
 
 		it("should handle single file", () => {
-			expect(inferTargetPath("agent/test.md")).toBe(".opencode/agent/test.md")
+			expect(inferTargetPath("agents/test.md")).toBe("agents/test.md")
 		})
 	})
 
 	describe("normalizeFile", () => {
 		it("should convert string path to object", () => {
-			const result = normalizeFile("plugin/foo.ts")
+			const result = normalizeFile("plugins/foo.ts")
 			expect(result).toEqual({
-				path: "plugin/foo.ts",
-				target: ".opencode/plugin/foo.ts",
+				path: "plugins/foo.ts",
+				target: "plugins/foo.ts",
 			})
 		})
 
-		it("should pass through object unchanged", () => {
-			const input = { path: "src/custom.ts", target: ".opencode/plugin/custom.ts" }
+		it("should pass through object with target validation", () => {
+			const input = { path: "src/custom.ts", target: "plugins/custom.ts" }
 			const result = normalizeFile(input)
 			expect(result).toEqual(input)
 		})
@@ -231,7 +305,7 @@ describe("schemas", () => {
 			const result = normalizeFile("skills/my-skill/SKILL.md")
 			expect(result).toEqual({
 				path: "skills/my-skill/SKILL.md",
-				target: ".opencode/skills/my-skill/SKILL.md",
+				target: "skills/my-skill/SKILL.md",
 			})
 		})
 	})
@@ -386,6 +460,111 @@ describe("schemas", () => {
 			const result = permissionConfigSchema.parse(config)
 			expect(result.bash).toBe("allow")
 			expect(result.edit).toEqual({ "*.config.*": "deny" })
+		})
+	})
+
+	describe("registrySchema", () => {
+		const validRegistry = {
+			name: "Test Registry",
+			version: "1.0.0",
+			author: "Test Author",
+			components: [],
+		}
+
+		it("should accept a valid registry with all required fields", () => {
+			expect(() => registrySchema.parse(validRegistry)).not.toThrow()
+		})
+
+		it("should require name (intentional — registries must be identifiable)", () => {
+			const { name: _, ...registryWithoutName } = validRegistry
+			const result = registrySchema.safeParse(registryWithoutName)
+			expect(result.success).toBe(false)
+			if (!result.success) {
+				const paths = result.error.issues.map((i) => i.path.join("."))
+				expect(paths).toContain("name")
+			}
+		})
+
+		it("should require version (intentional — enables deterministic resolution)", () => {
+			const { version: _, ...registryWithoutVersion } = validRegistry
+			const result = registrySchema.safeParse(registryWithoutVersion)
+			expect(result.success).toBe(false)
+			if (!result.success) {
+				const paths = result.error.issues.map((i) => i.path.join("."))
+				expect(paths).toContain("version")
+			}
+		})
+
+		it("should require author", () => {
+			const { author: _, ...registryWithoutAuthor } = validRegistry
+			const result = registrySchema.safeParse(registryWithoutAuthor)
+			expect(result.success).toBe(false)
+			if (!result.success) {
+				const paths = result.error.issues.map((i) => i.path.join("."))
+				expect(paths).toContain("author")
+			}
+		})
+
+		it("should reject empty name string", () => {
+			const result = registrySchema.safeParse({ ...validRegistry, name: "" })
+			expect(result.success).toBe(false)
+		})
+
+		it("should reject invalid semver version", () => {
+			const result = registrySchema.safeParse({ ...validRegistry, version: "not-semver" })
+			expect(result.success).toBe(false)
+		})
+
+		it("should accept optional fields like opencode and ocx versions", () => {
+			const registry = {
+				...validRegistry,
+				opencode: "1.0.0",
+				ocx: "2.0.0",
+			}
+			expect(() => registrySchema.parse(registry)).not.toThrow()
+		})
+
+		it("should not require namespace field", () => {
+			// namespace was removed; ensure it doesn't cause validation failure as extra key
+			// registrySchema uses .object() which strips unknown keys by default
+			const registryWithNamespace = { ...validRegistry, namespace: "kdco" }
+			expect(() => registrySchema.parse(registryWithNamespace)).not.toThrow()
+		})
+	})
+
+	describe("parseCanonicalId", () => {
+		it("should parse valid canonical ID", () => {
+			const id = "https://registry.example.com::kdco/component@1.0.0"
+			const result = parseCanonicalId(id)
+			expect(result.registryUrl).toBe("https://registry.example.com")
+			expect(result.registryName).toBe("kdco")
+			expect(result.name).toBe("component")
+			expect(result.revision).toBe("1.0.0")
+		})
+
+		it("should parse canonical ID with @ in revision", () => {
+			const id = "https://registry.example.com::kdco/component@user@branch"
+			const result = parseCanonicalId(id)
+			expect(result.registryUrl).toBe("https://registry.example.com")
+			expect(result.registryName).toBe("kdco")
+			expect(result.name).toBe("component")
+			expect(result.revision).toBe("user@branch")
+		})
+
+		it("should parse canonical ID with multiple @ in revision", () => {
+			const id = "https://registry.example.com::kdco/component@feature@user@domain"
+			const result = parseCanonicalId(id)
+			expect(result.revision).toBe("feature@user@domain")
+		})
+
+		it("should throw for missing revision separator", () => {
+			const id = "https://registry.example.com::kdco/component"
+			expect(() => parseCanonicalId(id)).toThrow("Expected format")
+		})
+
+		it("should throw for missing namespace separator", () => {
+			const id = "https://registry.example.com::component@1.0.0"
+			expect(() => parseCanonicalId(id)).toThrow("qualified")
 		})
 	})
 })

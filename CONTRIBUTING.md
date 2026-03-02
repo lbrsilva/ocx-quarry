@@ -14,9 +14,9 @@ Create a directory for your registry source:
 my-registry/
 ├── registry.jsonc      # Required: metadata and component definitions
 └── files/              # Component source files
-    ├── agent/          # .md files
+    ├── agents/          # .md files
     ├── skills/          # Directories with SKILL.md
-    └── plugin/         # .ts files (can have sub-directories)
+    └── plugins/         # .ts files (can have sub-directories)
 ```
 
 ### 2. Registry Manifest (registry.jsonc)
@@ -32,12 +32,12 @@ Your `registry.jsonc` defines a namespace for all components:
   "components": [
     {
       "name": "component",
-      "type": "ocx:plugin",
+      "type": "plugin",
       "description": "What it does",
       "files": [
         {
-          "path": "plugin/my-plugin.ts",
-          "target": ".opencode/plugin/component.ts"
+          "path": "plugins/my-plugin.ts",
+          "target": "plugins/component.ts"
         }
       ],
       "dependencies": []
@@ -46,7 +46,7 @@ Your `registry.jsonc` defines a namespace for all components:
 }
 ```
 
-**Note:** Component names are clean (no prefix). The namespace is used for CLI references: `ocx add my/component`
+**Note:** Component names are clean (no prefix). The registry name you choose with `--name` determines CLI references: `ocx add my/component`
 
 ### 3. Building the Registry
 
@@ -57,7 +57,7 @@ ocx build ./my-registry --out ./dist
 ```
 
 The build command enforces:
-- Valid namespace identifier
+- Valid registry namespace
 - Valid semver
 - Valid OpenCode target paths
 
@@ -94,10 +94,8 @@ Use the `ocx-dev` profile to keep testing completely separate.
 #### Setup ocx-dev Profile (One-time)
 
 ```bash
-# Create the ocx-dev profile
-./packages/cli/dist/index.js profile add ocx-dev
-
-# Profile is automatically available for use
+# Create a global profile for isolated testing
+./packages/cli/dist/index.js profile add ocx-dev --global
 ```
 
 #### Quick Feature Testing
@@ -198,7 +196,6 @@ Key test scenarios:
 - `--all` flag updates all components
 - `--registry` flag scopes to registry
 - `--dry-run` previews without changes
-- `@version` syntax pins to specific version
 - Error cases (conflicts, missing components)
 
 > **Note:** For quick manual testing or AI-driven testing, prefer Profile Mode Testing above.
@@ -228,8 +225,8 @@ cd packages/cli && bun run build && cd ../..
 # 5. Add local registry (MUST use absolute path with file://)
 ./packages/cli/dist/index.js registry add "file://$(pwd)/workers/kdco-registry/dist" --name kdco
 
-# 6. Install components (using namespace/component syntax)
-./packages/cli/dist/index.js add kdco/workspace --force
+# 6. Install components (using alias/component syntax)
+./packages/cli/dist/index.js add kdco/workspace
 
 # 7. Verify the result
 cat opencode.jsonc
@@ -263,7 +260,7 @@ For repeated testing (assumes registry is already built):
 rm -rf .opencode && \
 ./packages/cli/dist/index.js init && \
 ./packages/cli/dist/index.js registry add "file://$(pwd)/workers/kdco-registry/dist" --name kdco && \
-./packages/cli/dist/index.js add kdco/workspace --force && \
+./packages/cli/dist/index.js add kdco/workspace && \
 cat .opencode/opencode.jsonc
 ```
 

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { readFile, writeFile } from "node:fs/promises"
+import { join } from "node:path"
+import { parse as parseJsonc } from "jsonc-parser"
 import { cleanupTempDir, createTempDir, runCLI } from "./helpers"
 import { type MockRegistry, startMockRegistry } from "./mock-registry"
 
@@ -9,7 +12,7 @@ describe("ocx search", () => {
 	beforeEach(async () => {
 		testDir = await createTempDir("search-test")
 		registry = startMockRegistry()
-		await runCLI(["init", "--force"], testDir)
+		await runCLI(["init"], testDir)
 		const addResult = await runCLI(["registry", "add", registry.url, "--name", "kdco"], testDir)
 		if (addResult.exitCode !== 0) {
 			console.log("Failed to add registry in search test:", addResult.output)
@@ -43,7 +46,7 @@ describe("ocx search", () => {
 
 	it("should list installed components with --installed", async () => {
 		// Install one component
-		await runCLI(["add", "kdco/test-plugin", "--force"], testDir)
+		await runCLI(["add", "kdco/test-plugin"], testDir)
 
 		const { exitCode, output } = await runCLI(["search", "--installed"], testDir)
 
@@ -60,5 +63,43 @@ describe("ocx search", () => {
 		expect(json.success).toBe(true)
 		expect(json.data.components).toBeDefined()
 		expect(json.data.components.length).toBeGreaterThan(0)
+	})
+
+	it("should skip incompatible registries and continue searching others", async () => {
+		const badServer = Bun.serve({
+			port: 0,
+			fetch() {
+				return Response.json({
+					author: "Legacy Registry",
+					components: [{ name: "legacy", type: "plugin", description: "Legacy" }],
+				})
+			},
+		})
+
+		try {
+			const configPath = join(testDir, ".opencode", "ocx.jsonc")
+			const config = parseJsonc(await readFile(configPath, "utf-8")) as {
+				registries?: Record<string, { url: string }>
+			}
+
+			config.registries = {
+				...(config.registries ?? {}),
+				legacy: { url: `http://localhost:${badServer.port}` },
+			}
+			await writeFile(configPath, JSON.stringify(config, null, 2))
+
+			const { exitCode, output } = await runCLI(["search", "test", "--json"], testDir)
+
+			expect(exitCode).toBe(0)
+			const json = JSON.parse(output) as {
+				success: boolean
+				data: { components: Array<{ name: string }> }
+			}
+			expect(json.success).toBe(true)
+			expect(json.data.components.some((c) => c.name === "kdco/test-plugin")).toBe(true)
+			expect(json.data.components.some((c) => c.name.startsWith("legacy/"))).toBe(false)
+		} finally {
+			badServer.stop()
+		}
 	})
 })

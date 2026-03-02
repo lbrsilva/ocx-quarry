@@ -3,22 +3,27 @@
  * Update installed components from registries
  */
 
-import { createHash } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 
 import type { Command } from "commander"
 import { type ConfigProvider, LocalConfigProvider } from "../config/provider"
 import { fetchComponentVersion, fetchFileContent } from "../registry/fetcher"
-import { findOcxLock, type OcxLock, readOcxLock, writeOcxLock } from "../schemas/config"
+import { parseCanonicalId, type Receipt, readReceipt, writeReceipt } from "../schemas/config"
 import {
 	type ComponentFileObject,
 	normalizeComponentManifest,
 	parseQualifiedComponent,
 } from "../schemas/registry"
+import { type DryRunAction, type DryRunResult, outputDryRun } from "../utils/dry-run"
 import { ConfigError, NotFoundError, ValidationError } from "../utils/errors"
 import { createSpinner, handleError, logger } from "../utils/index"
+import { resolveTargetPath } from "../utils/paths"
+import { registerPlannedWriteOrThrow } from "../utils/planned-writes"
+import { hashBundle, hashContent } from "../utils/receipt"
+import { addCommonOptions, addVerboseOption } from "../utils/shared-options"
 
 // =============================================================================
 // TYPES
@@ -36,7 +41,6 @@ export interface UpdateOptions {
 
 interface ComponentSpec {
 	component: string
-	version?: string
 }
 
 interface UpdateResult {
@@ -46,23 +50,62 @@ interface UpdateResult {
 	status: "updated" | "up-to-date" | "would-update"
 }
 
+interface PreparedUpdateFile {
+	resolvedTarget: string
+	targetPath: string
+	content: Buffer
+}
+
+interface PendingUpdate {
+	canonicalId: string
+	component: ReturnType<typeof normalizeComponentManifest>
+	files: { path: string; content: Buffer }[]
+	newHash: string
+	newVersion: string
+	baseUrl: string
+	registryName: string
+	name: string
+}
+
+interface PreparedUpdate {
+	update: PendingUpdate
+	preparedFiles: PreparedUpdateFile[]
+}
+
+interface AppliedWrite {
+	targetPath: string
+	backupPath: string | null
+}
+
+interface AppliedWriteTransaction {
+	commit: () => Promise<void>
+	rollback: () => Promise<void>
+}
+
+interface UpdateFileOps {
+	rename?: (oldPath: string, newPath: string) => Promise<void>
+}
+
+type UpdateFailurePhase = "check" | "apply"
+
+export function resolveUpdateFailureMessage(phase: UpdateFailurePhase): string {
+	return phase === "apply" ? "Failed to update components" : "Failed to check for updates"
+}
+
 // =============================================================================
 // COMMAND REGISTRATION
 // =============================================================================
 
 export function registerUpdateCommand(program: Command): void {
-	program
-		.command("update [components...]")
-		.description(
-			"Update installed components (use @version suffix to pin, e.g., kdco/agents@1.2.0)",
-		)
+	const cmd = program.command("update [components...]").description("Update installed components")
+
+	addCommonOptions(cmd)
+	addVerboseOption(cmd)
+
+	cmd
 		.option("--all", "Update all installed components")
 		.option("--registry <name>", "Update all components from a specific registry")
 		.option("--dry-run", "Preview changes without applying")
-		.option("--cwd <path>", "Working directory", process.cwd())
-		.option("-q, --quiet", "Suppress output")
-		.option("-v, --verbose", "Verbose output")
-		.option("--json", "Output as JSON")
 		.action(async (components: string[], options: UpdateOptions) => {
 			try {
 				await runUpdate(components, options)
@@ -90,18 +133,33 @@ export async function runUpdateCore(
 	componentNames: string[],
 	options: UpdateOptions,
 	provider: ConfigProvider,
+	fileOps?: UpdateFileOps,
 ): Promise<void> {
-	const { path: lockPath } = findOcxLock(provider.cwd)
 	const registries = provider.getRegistries()
+	const componentPath = provider.getComponentPath()
+	const isFlattened = componentPath === "" || componentPath === "."
+
+	// -------------------------------------------------------------------------
+	// Parse component specs (Law 2: Parse at boundary before any logic)
+	// -------------------------------------------------------------------------
+
+	const parsedComponents = componentNames.map(parseComponentSpec)
 
 	// -------------------------------------------------------------------------
 	// Guard clauses (Law 1: Early Exit)
 	// -------------------------------------------------------------------------
 
-	// Guard: No lock file (nothing installed yet)
-	const lock = await readOcxLock(provider.cwd)
-	if (!lock || Object.keys(lock.installed).length === 0) {
-		throw new ValidationError("Nothing installed yet. Run 'ocx add <component>' first.")
+	// Guard: No receipt file (nothing installed yet)
+	const receipt = await readReceipt(provider.cwd)
+	if (!receipt || Object.keys(receipt.installed).length === 0) {
+		// If user specified components, give specific error
+		if (componentNames.length > 0) {
+			throw new NotFoundError(
+				`Component '${componentNames[0]}' is not installed. Run 'ocx add ${componentNames[0]}' first.`,
+			)
+		}
+		// Generic case for --all or --registry
+		throw new NotFoundError("No components installed. Run 'ocx add <component>' first.")
 	}
 
 	// Guard: No args and no flags
@@ -112,9 +170,9 @@ export async function runUpdateCore(
 		throw new ValidationError(
 			"Specify components, use --all, or use --registry <name>.\n\n" +
 				"Examples:\n" +
-				"  ocx update kdco/agents           # Update specific component\n" +
-				"  ocx update --all                 # Update all installed components\n" +
-				"  ocx update --registry kdco       # Update all from a registry",
+				"  ocx update alias/component        # Update specific component\n" +
+				"  ocx update --all                   # Update all installed components\n" +
+				"  ocx update --registry my-alias     # Update all from a registry",
 		)
 	}
 
@@ -143,26 +201,10 @@ export async function runUpdateCore(
 	}
 
 	// -------------------------------------------------------------------------
-	// Parse component specs and validate versions
-	// -------------------------------------------------------------------------
-
-	const parsedComponents = componentNames.map(parseComponentSpec)
-
-	// Guard: Invalid version specifier (e.g., kdco/agents@ or kdco/agents@@1.2.0)
-	for (const spec of parsedComponents) {
-		if (spec.version !== undefined && spec.version === "") {
-			throw new ValidationError(
-				`Invalid version specifier in '${spec.component}@'.` +
-					"\nVersion cannot be empty. Use 'kdco/agents@1.2.0' or omit the version for latest.",
-			)
-		}
-	}
-
-	// -------------------------------------------------------------------------
 	// Determine which components to update
 	// -------------------------------------------------------------------------
 
-	const componentsToUpdate = resolveComponentsToUpdate(lock, parsedComponents, options)
+	const componentsToUpdate = resolveComponentsToUpdate(receipt, parsedComponents, options)
 
 	// Guard: No matching components
 	if (componentsToUpdate.length === 0) {
@@ -178,40 +220,36 @@ export async function runUpdateCore(
 
 	const spin = options.quiet ? null : createSpinner({ text: "Checking for updates..." })
 	spin?.start()
+	let installSpin: ReturnType<typeof createSpinner> | null = null
+	let failurePhase: UpdateFailurePhase = "check"
+	let appliedWriteTransaction: AppliedWriteTransaction | null = null
 
 	const results: UpdateResult[] = []
-	const updates: {
-		qualifiedName: string
-		component: ReturnType<typeof normalizeComponentManifest>
-		files: { path: string; content: Buffer }[]
-		newHash: string
-		newVersion: string
-		baseUrl: string
-	}[] = []
+	const updates: PendingUpdate[] = []
 
 	try {
 		for (const spec of componentsToUpdate) {
-			const qualifiedName = spec.component
-			const lockEntry = lock.installed[qualifiedName]
-			// Guard: component must exist in lock (already validated in resolveComponentsToUpdate)
-			if (!lockEntry) {
-				throw new NotFoundError(`Component '${qualifiedName}' not found in lock file.`)
+			const canonicalId = spec.component
+			const entry = receipt.installed[canonicalId]
+			// Guard: component must exist in receipt (already validated in resolveComponentsToUpdate)
+			if (!entry) {
+				throw new NotFoundError(`Component '${canonicalId}' not found in receipt.`)
 			}
 
-			const { namespace, component: componentName } = parseQualifiedComponent(qualifiedName)
+			const registryName = entry.registryName
+			const componentName = entry.name
 
-			// Get registry config
-			const regConfig = registries[namespace]
+			// Get registry config by alias
+			const regConfig = registries[registryName]
 			if (!regConfig) {
 				throw new ConfigError(
-					`Registry '${namespace}' not configured. Component '${qualifiedName}' cannot be updated.`,
+					`Registry alias '${registryName}' not configured. Component '${canonicalId}' cannot be updated.`,
 				)
 			}
 
-			// Fetch component (specific version or latest)
-			const fetchResult = await fetchComponentVersion(regConfig.url, componentName, spec.version)
+			// Fetch component (latest version)
+			const fetchResult = await fetchComponentVersion(regConfig.url, componentName, undefined)
 			const manifest = fetchResult.manifest
-			const version = fetchResult.version
 
 			const normalizedManifest = normalizeComponentManifest(manifest)
 
@@ -223,36 +261,39 @@ export async function runUpdateCore(
 			}
 
 			const newHash = await hashBundle(files)
+			const newVersion = `sha256:${newHash}` // Use hash as version/revision
 
 			// Compare hashes
-			if (newHash === lockEntry.hash) {
+			if (newHash === entry.hash) {
 				results.push({
-					qualifiedName,
-					oldVersion: lockEntry.version,
-					newVersion: version,
+					qualifiedName: canonicalId,
+					oldVersion: entry.revision,
+					newVersion: newVersion,
 					status: "up-to-date",
 				})
 			} else if (options.dryRun) {
 				results.push({
-					qualifiedName,
-					oldVersion: lockEntry.version,
-					newVersion: version,
+					qualifiedName: canonicalId,
+					oldVersion: entry.revision,
+					newVersion: newVersion,
 					status: "would-update",
 				})
 			} else {
 				results.push({
-					qualifiedName,
-					oldVersion: lockEntry.version,
-					newVersion: version,
+					qualifiedName: canonicalId,
+					oldVersion: entry.revision,
+					newVersion: newVersion,
 					status: "updated",
 				})
 				updates.push({
-					qualifiedName,
+					canonicalId,
 					component: normalizedManifest,
 					files,
 					newHash,
-					newVersion: version,
+					newVersion: newVersion,
 					baseUrl: regConfig.url,
+					registryName,
+					name: componentName,
 				})
 			}
 		}
@@ -264,7 +305,7 @@ export async function runUpdateCore(
 		// -------------------------------------------------------------------------
 
 		if (options.dryRun) {
-			outputDryRun(results, options)
+			outputUpdateDryRun(results, options)
 			return
 		}
 
@@ -283,50 +324,104 @@ export async function runUpdateCore(
 			return
 		}
 
-		const installSpin = options.quiet ? null : createSpinner({ text: "Updating components..." })
+		failurePhase = "apply"
+		installSpin = options.quiet ? null : createSpinner({ text: "Updating components..." })
 		installSpin?.start()
 
+		const plannedWrites = new Map<
+			string,
+			{
+				absolutePath: string
+				relativePath: string
+				content: Buffer
+				source: string
+			}
+		>()
+
+		const preparedUpdates: PreparedUpdate[] = []
+
 		for (const update of updates) {
-			// Write files
+			const preparedFiles: PreparedUpdateFile[] = []
+
 			for (const file of update.files) {
 				const fileObj = update.component.files.find(
 					(f: ComponentFileObject) => f.path === file.path,
 				)
-				if (!fileObj) continue
-
-				const targetPath = join(provider.cwd, fileObj.target)
-				const targetDir = dirname(targetPath)
-
-				if (!existsSync(targetDir)) {
-					await mkdir(targetDir, { recursive: true })
+				if (!fileObj) {
+					throw new ValidationError(
+						`File "${file.path}" not found in component manifest for "${update.registryName}/${update.name}".`,
+					)
 				}
 
-				await writeFile(targetPath, file.content)
+				const resolvedTarget = resolveTargetPath(fileObj.target, isFlattened, provider.cwd)
+				const targetPath = join(provider.cwd, resolvedTarget)
 
-				if (options.verbose) {
-					logger.info(`  ✓ Updated ${fileObj.target}`)
-				}
+				registerPlannedWriteOrThrow(plannedWrites, {
+					absolutePath: targetPath,
+					relativePath: resolvedTarget,
+					content: file.content,
+					source: `${update.registryName}/${update.name}:${fileObj.path}`,
+				})
+
+				preparedFiles.push({
+					resolvedTarget,
+					targetPath,
+					content: file.content,
+				})
 			}
 
-			// Update lock entry - we know it exists because we validated in resolveComponentsToUpdate
-			const existingEntry = lock.installed[update.qualifiedName]
+			preparedUpdates.push({ update, preparedFiles })
+		}
+
+		appliedWriteTransaction = await applyPreparedUpdatesAtomically(preparedUpdates, {
+			verbose: options.verbose,
+			quiet: options.quiet,
+			fileOps,
+		})
+
+		for (const prepared of preparedUpdates) {
+			const { update, preparedFiles } = prepared
+
+			// Update receipt entry - we know it exists because we validated in resolveComponentsToUpdate
+			const existingEntry = receipt.installed[update.canonicalId]
 			if (!existingEntry) {
-				throw new NotFoundError(`Component '${update.qualifiedName}' not found in lock file.`)
+				throw new NotFoundError(`Component '${update.canonicalId}' not found in receipt.`)
 			}
-			lock.installed[update.qualifiedName] = {
-				registry: existingEntry.registry,
-				version: update.newVersion,
+
+			// Compute individual file hashes
+			const fileHashes: Array<{ path: string; hash: string }> = []
+			for (const preparedFile of preparedFiles) {
+				fileHashes.push({
+					path: preparedFile.resolvedTarget,
+					hash: hashContent(preparedFile.content),
+				})
+			}
+
+			receipt.installed[update.canonicalId] = {
+				registryUrl: existingEntry.registryUrl,
+				registryName: existingEntry.registryName,
+				name: existingEntry.name,
+				revision: update.newVersion,
 				hash: update.newHash,
-				files: existingEntry.files,
+				files: fileHashes,
 				installedAt: existingEntry.installedAt,
 				updatedAt: new Date().toISOString(),
+				// Update opencode config if component provides it
+				...(update.component.opencode && {
+					opencode: update.component.opencode as Record<string, unknown>,
+				}),
 			}
 		}
 
-		installSpin?.succeed(`Updated ${updates.length} component(s)`)
+		// Save receipt file
+		await writeReceipt(provider.cwd, receipt)
+		if (!appliedWriteTransaction) {
+			throw new Error("Internal error: missing applied write transaction after update apply phase.")
+		}
+		await appliedWriteTransaction.commit()
+		appliedWriteTransaction = null
 
-		// Save lock file
-		await writeOcxLock(provider.cwd, lock, lockPath)
+		installSpin?.succeed(`Updated ${updates.length} component(s)`)
 
 		// -------------------------------------------------------------------------
 		// Output results
@@ -357,7 +452,15 @@ export async function runUpdateCore(
 			logger.success(`Done! Updated ${updates.length} component(s).`)
 		}
 	} catch (error) {
-		spin?.fail("Failed to check for updates")
+		if (failurePhase === "apply") {
+			if (appliedWriteTransaction) {
+				await appliedWriteTransaction.rollback()
+				appliedWriteTransaction = null
+			}
+			installSpin?.fail(resolveUpdateFailureMessage("apply"))
+		} else {
+			spin?.fail(resolveUpdateFailureMessage("check"))
+		}
 		throw error
 	}
 }
@@ -366,60 +469,192 @@ export async function runUpdateCore(
 // HELPER FUNCTIONS
 // =============================================================================
 
-/**
- * Parse a component specifier into component name and optional version.
- * Uses lastIndexOf to handle edge cases like kdco@agents@1.2.0.
- * Law 2: Parse at boundary, trust internally.
- *
- * @example
- * parseComponentSpec("kdco/agents@1.2.0") // { component: "kdco/agents", version: "1.2.0" }
- * parseComponentSpec("kdco/agents")       // { component: "kdco/agents" }
- */
-function parseComponentSpec(spec: string): ComponentSpec {
-	const atIndex = spec.lastIndexOf("@")
-	// @ at start or not found means no version
-	if (atIndex <= 0) {
-		return { component: spec }
+async function applyPreparedUpdatesAtomically(
+	preparedUpdates: PreparedUpdate[],
+	options: { verbose?: boolean; quiet?: boolean; fileOps?: UpdateFileOps },
+): Promise<AppliedWriteTransaction> {
+	const appliedWrites: AppliedWrite[] = []
+	const tempPaths = new Set<string>()
+	let finalized = false
+	const renameFile = options.fileOps?.rename ?? rename
+
+	const rollback = async (): Promise<void> => {
+		if (finalized) {
+			return
+		}
+
+		finalized = true
+
+		for (const tempPath of tempPaths) {
+			try {
+				await rm(tempPath, { force: true })
+			} catch {
+				// best-effort cleanup
+			}
+		}
+
+		for (const appliedWrite of [...appliedWrites].reverse()) {
+			try {
+				if (appliedWrite.backupPath) {
+					if (existsSync(appliedWrite.targetPath)) {
+						await rm(appliedWrite.targetPath, { force: true, recursive: true })
+					}
+					if (existsSync(appliedWrite.backupPath)) {
+						await renameFile(appliedWrite.backupPath, appliedWrite.targetPath)
+					}
+				} else if (existsSync(appliedWrite.targetPath)) {
+					await rm(appliedWrite.targetPath, { force: true, recursive: true })
+				}
+			} catch {
+				// best-effort rollback
+			}
+		}
 	}
-	return {
-		component: spec.slice(0, atIndex),
-		version: spec.slice(atIndex + 1),
+
+	const commit = async (): Promise<void> => {
+		if (finalized) {
+			return
+		}
+
+		finalized = true
+
+		for (const appliedWrite of appliedWrites) {
+			if (!appliedWrite.backupPath) {
+				continue
+			}
+
+			if (existsSync(appliedWrite.backupPath)) {
+				try {
+					await rm(appliedWrite.backupPath, { force: true })
+				} catch (error) {
+					if (!options.quiet) {
+						const errorMessage = error instanceof Error ? error.message : String(error)
+						logger.warn(
+							`Post-update cleanup warning: failed to remove backup "${appliedWrite.backupPath}" (${errorMessage})`,
+						)
+					}
+				}
+			}
+		}
+	}
+
+	try {
+		for (const prepared of preparedUpdates) {
+			for (const preparedFile of prepared.preparedFiles) {
+				const targetDir = dirname(preparedFile.targetPath)
+
+				if (!existsSync(targetDir)) {
+					await mkdir(targetDir, { recursive: true })
+				}
+
+				if (existsSync(preparedFile.targetPath)) {
+					const currentTargetStats = await stat(preparedFile.targetPath)
+					if (currentTargetStats.isDirectory()) {
+						throw new ValidationError(
+							`Cannot update "${preparedFile.resolvedTarget}": target path is a directory.`,
+						)
+					}
+				}
+
+				const tempPath = `${preparedFile.targetPath}.ocx-update-tmp-${randomUUID()}`
+				await writeFile(tempPath, preparedFile.content)
+				tempPaths.add(tempPath)
+
+				let backupPath: string | null = null
+				if (existsSync(preparedFile.targetPath)) {
+					backupPath = `${preparedFile.targetPath}.ocx-update-backup-${randomUUID()}`
+					await renameFile(preparedFile.targetPath, backupPath)
+					appliedWrites.push({
+						targetPath: preparedFile.targetPath,
+						backupPath,
+					})
+				}
+
+				await renameFile(tempPath, preparedFile.targetPath)
+				tempPaths.delete(tempPath)
+
+				if (!backupPath) {
+					appliedWrites.push({
+						targetPath: preparedFile.targetPath,
+						backupPath: null,
+					})
+				}
+
+				if (options.verbose) {
+					logger.info(`  ✓ Updated ${preparedFile.resolvedTarget}`)
+				}
+			}
+		}
+
+		return { commit, rollback }
+	} catch (error) {
+		await rollback()
+		throw error
 	}
 }
 
 /**
+ * Parse and validate a component specifier.
+ * Law 2: Parse at boundary, trust internally.
+ * Law 4: Fail fast on malformed specifiers before receipt lookup.
+ *
+ * Rejects trailing `@` (empty version) since update always fetches latest.
+ *
+ * @example
+ * parseComponentSpec("kdco/agents") // { component: "kdco/agents" }
+ * parseComponentSpec("kdco/agents@") // throws ConfigError
+ */
+function parseComponentSpec(spec: string): ComponentSpec {
+	if (spec.endsWith("@")) {
+		throw new ConfigError(
+			`Invalid version specifier '${spec}'. The trailing '@' has no version.\n` +
+				`Use '${spec.slice(0, -1)}' to update to the latest version.`,
+		)
+	}
+
+	return { component: spec }
+}
+
+/**
  * Resolve which components to update based on args and flags.
- * Law 4: Fail fast if component not found in lock.
+ * Law 4: Fail fast if component not found in receipt.
  */
 function resolveComponentsToUpdate(
-	lock: OcxLock,
+	receipt: Receipt,
 	parsedComponents: ComponentSpec[],
 	options: UpdateOptions,
 ): ComponentSpec[] {
-	const installedComponents = Object.keys(lock.installed)
+	const installedComponents = Object.keys(receipt.installed)
 
 	// --all: update all installed components (no version override)
 	if (options.all) {
 		return installedComponents.map((c) => ({ component: c }))
 	}
 
-	// --registry: filter by registry namespace (no version override)
+	// --registry: filter by registry alias (no version override)
 	if (options.registry) {
 		return installedComponents
-			.filter((name) => {
-				const entry = lock.installed[name]
-				return entry?.registry === options.registry
+			.filter((canonicalId) => {
+				const entry = receipt.installed[canonicalId]
+				return entry?.registryName === options.registry
 			})
 			.map((c) => ({ component: c }))
 	}
 
 	// Specific components: validate they exist
+	// User provides qualified names like "alias/component"
+	// We need to find the matching canonical ID in the receipt
 	const result: ComponentSpec[] = []
 	for (const spec of parsedComponents) {
 		const name = spec.component
 		// Validate format (must be qualified)
 		if (!name.includes("/")) {
-			const suggestions = installedComponents.filter((installed) => installed.endsWith(`/${name}`))
+			const suggestions = installedComponents
+				.map((id) => {
+					const parsed = parseCanonicalId(id)
+					return `${parsed.registryName}/${parsed.name}`
+				})
+				.filter((qualified) => qualified.endsWith(`/${name}`))
 			if (suggestions.length === 1) {
 				throw new ValidationError(
 					`Ambiguous component '${name}'. Did you mean '${suggestions[0]}'?`,
@@ -429,85 +664,60 @@ function resolveComponentsToUpdate(
 				throw new ValidationError(
 					`Ambiguous component '${name}'. Found in multiple registries:\n` +
 						suggestions.map((s) => `  - ${s}`).join("\n") +
-						"\n\nPlease use a fully qualified name (registry/component).",
+						"\n\nPlease use a fully qualified name (alias/component).",
 				)
 			}
 			throw new ValidationError(
-				`Component '${name}' must include a registry prefix (e.g., 'kdco/${name}').`,
+				`Component '${name}' must include a registry alias (e.g., 'kdco/${name}').`,
 			)
 		}
 
-		// Check if installed
-		if (!lock.installed[name]) {
+		// Find matching canonical ID
+		const { namespace: prefix, component } = parseQualifiedComponent(name)
+		const matchingIds = installedComponents.filter((id) => {
+			const parsed = parseCanonicalId(id)
+			return parsed.registryName === prefix && parsed.name === component
+		})
+
+		if (matchingIds.length === 0) {
 			throw new NotFoundError(
 				`Component '${name}' is not installed.\nRun 'ocx add ${name}' to install it first.`,
 			)
 		}
 
-		result.push(spec)
+		// Use the first matching canonical ID (there should only be one per alias/name pair)
+		const canonicalId = matchingIds[0]
+		if (!canonicalId) {
+			throw new Error(`Unexpected: matchingIds has length but first element is undefined`)
+		}
+		result.push({ component: canonicalId })
 	}
 
 	return result
 }
 
 /**
- * Output dry-run results.
+ * Output dry-run results using shared utility.
  */
-function outputDryRun(results: UpdateResult[], options: UpdateOptions): void {
+function outputUpdateDryRun(results: UpdateResult[], options: UpdateOptions): void {
 	const wouldUpdate = results.filter((r) => r.status === "would-update")
-	const upToDate = results.filter((r) => r.status === "up-to-date")
 
-	if (options.json) {
-		console.log(JSON.stringify({ dryRun: true, wouldUpdate, upToDate }, null, 2))
-		return
+	const actions: DryRunAction[] = wouldUpdate.map((result) => ({
+		action: "update",
+		target: result.qualifiedName,
+		details: { from: result.oldVersion, to: result.newVersion },
+	}))
+
+	const dryRunResult: DryRunResult = {
+		dryRun: true,
+		command: "update",
+		wouldPerform: actions,
+		validation: { passed: true },
+		summary:
+			wouldUpdate.length > 0
+				? `Would update ${wouldUpdate.length} component(s)`
+				: "All components are up to date",
 	}
 
-	if (!options.quiet) {
-		logger.info("")
-
-		if (wouldUpdate.length > 0) {
-			logger.info("Would update:")
-			for (const result of wouldUpdate) {
-				logger.info(`  ${result.qualifiedName} (${result.oldVersion} → ${result.newVersion})`)
-			}
-		}
-
-		if (upToDate.length > 0 && options.verbose) {
-			logger.info("")
-			logger.info("Already up to date:")
-			for (const result of upToDate) {
-				logger.info(`  ${result.qualifiedName}`)
-			}
-		}
-
-		if (wouldUpdate.length > 0) {
-			logger.info("")
-			logger.info("Run without --dry-run to apply changes.")
-		} else {
-			logger.info("All components are up to date.")
-		}
-	}
-}
-
-/**
- * Compute SHA-256 hash of file content.
- */
-async function hashContent(content: string | Buffer): Promise<string> {
-	return createHash("sha256").update(content).digest("hex")
-}
-
-/**
- * Compute deterministic hash for a bundle of files.
- * Files are sorted by path for consistent hashing.
- */
-async function hashBundle(files: { path: string; content: Buffer }[]): Promise<string> {
-	const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path))
-
-	const manifestParts: string[] = []
-	for (const file of sorted) {
-		const hash = await hashContent(file.content)
-		manifestParts.push(`${file.path}:${hash}`)
-	}
-
-	return hashContent(manifestParts.join("\n"))
+	outputDryRun(dryRunResult, { json: options.json, quiet: options.quiet })
 }

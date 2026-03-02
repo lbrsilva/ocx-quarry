@@ -5,18 +5,19 @@ Bundled multi-agent orchestration harness for OpenCode. One install, complete co
 ## Quick Start
 
 ```bash
-# Add registries (one-time)
-ocx registry add https://ocx-kit.kdco.dev --name kit --global
-ocx registry add https://registry.kdco.dev --name kdco --global
+# One-time setup
+ocx init --global
 
-# Install profile
-ocx profile add ws --from kit/ws
+# Install the KDCO workspace profile (OpenCode Free Models Only)
+ocx profile add ws --source tweak/p-1vp4xoqv --from https://tweakoc.com/r --global
 
 # Launch
 ocx oc -p ws
 ```
 
-See the [full installation guide](../../docs/guides/kdco-workspace.md) for customization options.
+Need a custom profile? Open the KDCO Workspace harness in TweakOC: https://tweakoc.com/h/kdco-workspace
+
+See the [full installation guide](../../docs/guides/kdco-workspace.mdx) for more customization options.
 
 ## What This Is
 
@@ -95,25 +96,13 @@ The bundle configures security boundaries:
 | scribe     | File write only, no bash                                 |
 | reviewer   | Read-only + git inspection                               |
 
-## Installation
-
-### 1. Install OCX
-
-See the [OCX repository](https://github.com/kdcokenny/ocx) for installation instructions.
-
-### 2. Add the KDCO Registry
+## Advanced: Direct Install (No Profile)
 
 ```bash
-ocx registry add https://registry.kdco.dev --name kdco
+ocx add kdco/workspace --from https://registry.kdco.dev
 ```
 
-> **Tip:** Add `--global` to configure the registry globally instead of per-project.
-
-### 3. Install the Bundle
-
-```bash
-ocx add kdco/workspace
-```
+If you don't have OCX installed, install it from the [OCX repository](https://github.com/kdcokenny/ocx).
 
 ## Owning Your Code
 

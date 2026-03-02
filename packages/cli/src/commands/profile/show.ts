@@ -3,6 +3,7 @@
  *
  * Display detailed information about a profile.
  * Shows the profile name, file paths, and OCX config contents.
+ * Profiles are global-only; local scope is unsupported and produces a hard error.
  */
 
 import type { Command } from "commander"
@@ -12,17 +13,20 @@ import {
 	getProfileOcxConfig,
 	getProfileOpencodeConfig,
 } from "../../profile/paths"
+import { ConfigError } from "../../utils/errors"
 import { handleError } from "../../utils/handle-error"
 import { sharedOptions } from "../../utils/shared-options"
 
 interface ProfileShowOptions {
+	global?: boolean
 	json?: boolean
 }
 
 export function registerProfileShowCommand(parent: Command): void {
 	parent
 		.command("show [name]")
-		.description("Display profile contents")
+		.description("Display profile contents (use --global; local profiles are unsupported)")
+		.option("-g, --global", "Show global profile (required — local profiles are unsupported)")
 		.addOption(sharedOptions.json())
 		.action(async (name: string | undefined, options: ProfileShowOptions) => {
 			try {
@@ -37,6 +41,14 @@ async function runProfileShow(
 	name: string | undefined,
 	options: ProfileShowOptions,
 ): Promise<void> {
+	// Guard: local scope is unsupported (Law 1: Early Exit, Law 4: Fail Fast)
+	if (!options.global) {
+		throw new ConfigError(
+			"Local profiles are unsupported. Use --global to show a global profile.\n\n" +
+				"  ocx profile show [name] --global",
+		)
+	}
+
 	const manager = await ProfileManager.requireInitialized()
 
 	// Use provided name or resolve profile (flag > env > default)

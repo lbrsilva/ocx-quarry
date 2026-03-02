@@ -3,10 +3,10 @@
  * Install components from registries
  */
 
-import { createHash } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, writeFile } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { lstat, mkdir, rename, rm, stat, writeFile } from "node:fs/promises"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 import type { Command } from "commander"
 import type { ConfigProvider } from "../config/provider"
@@ -16,24 +16,39 @@ import { CLI_VERSION, GITHUB_REPO } from "../constants"
 import { getProfileDir } from "../profile/paths"
 import { fetchFileContent, fetchRegistryIndex } from "../registry/fetcher"
 import type { ResolvedComponent } from "../registry/resolver"
-import { type ResolvedDependencies, resolveDependencies } from "../registry/resolver"
-import { findOcxLock, type OcxLock, readOcxLock, writeOcxLock } from "../schemas/config"
+import { resolveDependencies } from "../registry/resolver"
+import {
+	createCanonicalId,
+	findReceipt,
+	type Receipt,
+	readReceipt,
+	writeReceipt,
+} from "../schemas/config"
 import type { ComponentFileObject, RegistryIndex } from "../schemas/registry"
 import { parseQualifiedComponent } from "../schemas/registry"
 import {
+	findOpencodeConfig,
 	readOpencodeJsonConfig,
 	updateOpencodeJsonConfig,
 } from "../updaters/update-opencode-config"
 import { isContentIdentical } from "../utils/content"
+import {
+	buildInvalidationDryRunAction,
+	computeDependencyDelta,
+	type DepUpdateResult,
+	invalidateNodeModules,
+} from "../utils/dep-invalidation"
+import { type DryRunAction, type DryRunResult, outputDryRun } from "../utils/dry-run"
 import { ConfigError, ConflictError, IntegrityError, ValidationError } from "../utils/errors"
 import {
-	assertPathInside,
 	collectCompatIssues,
 	createSpinner,
 	handleError,
 	logger,
+	normalizeRegistryUrl,
 	warnCompatIssues,
 } from "../utils/index"
+import { outputJson } from "../utils/json-output"
 import {
 	extractPackageName,
 	fetchPackageVersion,
@@ -43,13 +58,54 @@ import {
 	validateNpmPackage,
 	validateOpenCodePlugin,
 } from "../utils/npm-registry"
+import { PathValidationError, validatePath } from "../utils/path-security"
 import { resolveTargetPath } from "../utils/paths"
-import {
-	addCommonOptions,
-	addForceOption,
-	addGlobalOption,
-	addVerboseOption,
-} from "../utils/shared-options"
+import { registerPlannedWriteOrThrow } from "../utils/planned-writes"
+import { hashBundle, hashContent } from "../utils/receipt"
+import { addCommonOptions, addGlobalOption, addVerboseOption } from "../utils/shared-options"
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/**
+ * Find the component that owns a given file path in the receipt.
+ * Returns the component's canonical ID or null if not found.
+ *
+ * @param receipt - The receipt to search
+ * @param filePath - The file path to look up (resolved target path)
+ * @returns Canonical ID if found, null otherwise
+ */
+function findOwningComponent(receipt: Receipt | null, filePath: string): string | null {
+	// Guard: no receipt or empty installed map
+	if (!receipt?.installed) return null
+
+	// Search all installed components for the file
+	for (const [canonicalId, entry] of Object.entries(receipt.installed)) {
+		if (entry.files?.some((f) => f.path === filePath)) {
+			return canonicalId
+		}
+	}
+
+	return null
+}
+
+/**
+ * Extract a human-readable component name from a canonical ID.
+ * Canonical ID format: "registryUrl::alias/component@revision"
+ *
+ * @param canonicalId - The canonical ID to parse
+ * @returns Component name in "alias/component" format
+ */
+function extractComponentName(canonicalId: string): string {
+	// Parse canonical ID: registryUrl::alias/component@revision
+	const afterDelimiter = canonicalId.split("::")[1]
+	if (!afterDelimiter) return canonicalId // Fallback to full ID
+
+	// Extract alias/component (before @)
+	const beforeVersion = afterDelimiter.split("@")[0]
+	return beforeVersion || canonicalId // Fallback to full ID
+}
 
 // =============================================================================
 // ADD INPUT TYPES (Discriminated Union)
@@ -84,20 +140,19 @@ export function parseAddInput(input: string): AddInput {
 	}
 
 	// Route registry components
-	// Check if it's a qualified reference (namespace/component)
+	// Check if it's a qualified reference (alias/component)
 	if (trimmed.includes("/")) {
 		const { namespace, component } = parseQualifiedComponent(trimmed)
 		return { type: "registry", namespace, component }
 	}
 
 	// Bare component name - needs registry resolution
-	// For now, treat as registry component without namespace
-	// The resolver will handle namespace inference from config
+	// For now, treat as registry component without alias
+	// The resolver will handle alias inference from config
 	return { type: "registry", namespace: "", component: trimmed }
 }
 
 export interface AddOptions {
-	force?: boolean
 	dryRun?: boolean
 	cwd?: string
 	quiet?: boolean
@@ -107,6 +162,44 @@ export interface AddOptions {
 	trust?: boolean
 	global?: boolean
 	profile?: string
+	from?: string
+}
+
+interface NpmAddResult {
+	plugins: string[]
+	dryRun: boolean
+}
+
+interface RegistryAddResult {
+	installed: string[]
+	opencode: boolean
+	dryRun: boolean
+}
+
+interface AppliedAddWrite {
+	targetPath: string
+	backupPath: string | null
+}
+
+interface AddWriteTransaction {
+	writeFileAtomically: (params: {
+		targetPath: string
+		resolvedTarget: string
+		content: Buffer
+	}) => Promise<void>
+	rollback: () => Promise<void>
+	commit: () => Promise<void>
+}
+
+interface AddManifestSideEffectTransaction {
+	rollback: () => Promise<void>
+	commit: () => void
+}
+
+interface FileSnapshot {
+	path: string
+	existed: boolean
+	content: string
 }
 
 export function registerAddCommand(program: Command): void {
@@ -114,47 +207,46 @@ export function registerAddCommand(program: Command): void {
 		.command("add")
 		.description(
 			"Add components or npm plugins to your project.\n\n" +
-				"  Registry components:  ocx add namespace/component\n" +
+				"  Registry components:  ocx add alias/component\n" +
 				"  npm plugins:          ocx add npm:package-name[@version]",
 		)
-		.argument(
-			"<components...>",
-			"Components to install (namespace/component or npm:package[@version])",
-		)
+		.argument("<components...>", "Components to install (alias/component or npm:package[@version])")
 		.option("--dry-run", "Show what would be installed without making changes")
 		.option("--skip-compat-check", "Skip version compatibility checks")
 		.option("--trust", "Skip npm plugin validation (for packages that don't follow conventions)")
 		.option("-p, --profile <name>", "Use specific profile")
+		.option("--from <url>", "Use ephemeral registry (does not persist)")
 
 	addCommonOptions(cmd)
-	addForceOption(cmd)
 	addVerboseOption(cmd)
 	addGlobalOption(cmd)
 
 	cmd.action(async (components: string[], options: AddOptions) => {
 		try {
+			const runtimeOptions = options.json ? { ...options, quiet: true, verbose: false } : options
+
 			// Create appropriate provider based on flags
 			let provider: ConfigProvider
 
-			if (options.profile) {
+			if (runtimeOptions.profile) {
 				// Use ConfigResolver with profile - cwd is the profile directory
-				const resolver = await ConfigResolver.create(options.cwd ?? process.cwd(), {
-					profile: options.profile,
+				const resolver = await ConfigResolver.create(runtimeOptions.cwd ?? process.cwd(), {
+					profile: runtimeOptions.profile,
 				})
 				// Profile mode: install to profile directory, not working directory
-				const profileDir = getProfileDir(options.profile)
+				const profileDir = getProfileDir(runtimeOptions.profile)
 				provider = {
 					cwd: profileDir,
 					getRegistries: () => resolver.getRegistries(),
 					getComponentPath: () => resolver.getComponentPath(),
 				}
-			} else if (options.global) {
+			} else if (runtimeOptions.global) {
 				provider = await GlobalConfigProvider.requireInitialized()
 			} else {
-				provider = await LocalConfigProvider.requireInitialized(options.cwd ?? process.cwd())
+				provider = await LocalConfigProvider.requireInitialized(runtimeOptions.cwd ?? process.cwd())
 			}
 
-			await runAddCore(components, options, provider)
+			await runAddCore(components, runtimeOptions, provider)
 		} catch (error) {
 			handleError(error, { json: options.json })
 		}
@@ -185,9 +277,19 @@ export async function runAddCore(
 		(i): i is AddInput & { type: "registry" } => i.type === "registry",
 	)
 
+	const shouldAggregateJson = Boolean(
+		options.json && npmInputs.length > 0 && registryInputs.length > 0,
+	)
+	const executionOptions = shouldAggregateJson
+		? { ...options, json: false, quiet: true, verbose: false }
+		: options
+
+	let npmResult: NpmAddResult | undefined
+	let registryResult: RegistryAddResult | undefined
+
 	// Handle npm plugins first
 	if (npmInputs.length > 0) {
-		await handleNpmPlugins(npmInputs, options, cwd)
+		npmResult = await handleNpmPlugins(npmInputs, executionOptions, cwd, !shouldAggregateJson)
 	}
 
 	// Handle registry components (existing flow)
@@ -196,7 +298,22 @@ export async function runAddCore(
 		const registryComponentNames = registryInputs.map((i) =>
 			i.namespace ? `${i.namespace}/${i.component}` : i.component,
 		)
-		await runRegistryAddCore(registryComponentNames, options, provider)
+		registryResult = await runRegistryAddCore(
+			registryComponentNames,
+			executionOptions,
+			provider,
+			!shouldAggregateJson,
+		)
+	}
+
+	if (shouldAggregateJson) {
+		outputJson({
+			success: true,
+			plugins: npmResult?.plugins ?? [],
+			installed: registryResult?.installed ?? [],
+			opencode: registryResult?.opencode ?? false,
+			dryRun: Boolean(npmResult?.dryRun || registryResult?.dryRun),
+		})
 	}
 }
 
@@ -208,7 +325,8 @@ async function handleNpmPlugins(
 	inputs: Array<{ type: "npm"; name: string; version?: string }>,
 	options: AddOptions,
 	cwd: string,
-): Promise<void> {
+	emitJson = true,
+): Promise<NpmAddResult> {
 	const spin = options.quiet ? null : createSpinner({ text: "Validating npm packages..." })
 	spin?.start()
 
@@ -272,12 +390,7 @@ async function handleNpmPlugins(
 
 			if (existingEntry) {
 				// Conflict: package already exists
-				if (!options.force) {
-					conflicts.push(input.name)
-				} else {
-					// With --force, replace existing entry
-					existingPluginMap.set(input.name, formatPluginEntry(input.name, input.version))
-				}
+				conflicts.push(input.name)
 			} else {
 				// New package
 				pluginsToAdd.push(formatPluginEntry(input.name, input.version))
@@ -288,7 +401,7 @@ async function handleNpmPlugins(
 		if (conflicts.length > 0) {
 			throw new ConflictError(
 				`Plugin(s) already exist in opencode.json: ${conflicts.join(", ")}.\n` +
-					"Use --force to replace existing entries.",
+					"Remove the existing entry manually or use 'ocx update' if it's an installed component.",
 			)
 		}
 
@@ -297,14 +410,27 @@ async function handleNpmPlugins(
 
 		// Dry run: just log what would happen
 		if (options.dryRun) {
-			logger.info("")
-			logger.info("Dry run - no changes made")
-			logger.info("")
-			logger.info("Would add npm plugins:")
-			for (const input of inputs) {
-				logger.info(`  ${formatPluginEntry(input.name, input.version)}`)
+			const actions: DryRunAction[] = inputs.map((input) => ({
+				action: "add",
+				target: formatPluginEntry(input.name, input.version),
+				details: { type: "npm plugin" },
+			}))
+
+			const dryRunResult: DryRunResult = {
+				dryRun: true,
+				command: "add",
+				wouldPerform: actions,
+				validation: { passed: true },
+				summary: `Would add ${inputs.length} npm plugin(s)`,
 			}
-			return
+
+			if (emitJson || !options.json) {
+				outputDryRun(dryRunResult, { json: options.json, quiet: options.quiet })
+			}
+			return {
+				plugins: inputs.map((input) => formatPluginEntry(input.name, input.version)),
+				dryRun: true,
+			}
 		}
 
 		// Update opencode.json with new plugins
@@ -318,18 +444,16 @@ async function handleNpmPlugins(
 			}
 		}
 
-		if (options.json) {
-			console.log(
-				JSON.stringify(
-					{
-						success: true,
-						plugins: inputs.map((i) => formatPluginEntry(i.name, i.version)),
-					},
-					null,
-					2,
-				),
-			)
+		const addedPlugins = inputs.map((input) => formatPluginEntry(input.name, input.version))
+
+		if (options.json && emitJson) {
+			outputJson({
+				success: true,
+				plugins: addedPlugins,
+			})
 		}
+
+		return { plugins: addedPlugins, dryRun: false }
 	} catch (error) {
 		spin?.fail("Failed to add npm plugins")
 		throw error
@@ -344,26 +468,95 @@ async function runRegistryAddCore(
 	componentNames: string[],
 	options: AddOptions,
 	provider: ConfigProvider,
-): Promise<void> {
+	emitJson = true,
+): Promise<RegistryAddResult> {
+	const suppressHumanOutput = Boolean(options.quiet || options.json)
 	const cwd = provider.cwd
-	// Use flattened paths for global/profile mode (no .opencode/ prefix)
-	const isFlattened = !!options.global || !!options.profile
-	const { path: lockPath } = findOcxLock(cwd, { isFlattened })
+	// V2: Determine if we're in flattened mode (profile/global vs local)
+	const isFlattened = !!(options.global || options.profile)
 	const registries = provider.getRegistries()
 
-	// Load or create lock
-	let lock: OcxLock = { lockVersion: 1, installed: {} }
-	const existingLock = await readOcxLock(cwd, { isFlattened })
-	if (existingLock) {
-		lock = existingLock
+	// V2: Handle --from flag for ephemeral registry
+	let effectiveRegistries = registries
+	if (options.from) {
+		// Validate --from URL
+		const fromUrl = options.from.trim()
+		if (!fromUrl) {
+			throw new ValidationError("--from URL cannot be empty")
+		}
+
+		// Parse URL to validate format
+		try {
+			new URL(fromUrl)
+		} catch {
+			throw new ValidationError(`Invalid --from URL: ${fromUrl}`)
+		}
+
+		// Parse component references to extract prefixes
+		const requestedPrefixes = new Set<string>()
+		for (const name of componentNames) {
+			const { namespace } = parseQualifiedComponent(name)
+			requestedPrefixes.add(namespace)
+		}
+
+		// Validate all requested components use the same prefix
+		if (requestedPrefixes.size > 1) {
+			const prefixes = Array.from(requestedPrefixes).join(", ")
+			throw new ValidationError(
+				`Mixed registry prefixes in --from call: ${prefixes}.\n` +
+					`When using --from, all components must use the same prefix.`,
+			)
+		}
+
+		// Use the single prefix as the ephemeral registry name
+		const ephemeralName = Array.from(requestedPrefixes)[0]
+		if (!ephemeralName) {
+			throw new ValidationError("No valid component references provided")
+		}
+
+		// Fetch registry index to validate the URL serves a valid registry (alias-first: ignore its namespace)
+		await fetchRegistryIndex(fromUrl)
+
+		// Create ephemeral registry config (does not persist)
+		effectiveRegistries = {
+			...registries,
+			[ephemeralName]: {
+				url: fromUrl,
+			},
+		}
 	}
 
-	const spin = options.quiet ? null : createSpinner({ text: "Resolving dependencies..." })
+	// V1: Load or create receipt
+	let receipt: Receipt = { version: 1, root: cwd, installed: {} }
+	const existingReceipt = await readReceipt(cwd)
+	if (existingReceipt) {
+		receipt = existingReceipt
+	}
+
+	const spin = suppressHumanOutput ? null : createSpinner({ text: "Resolving dependencies..." })
 	spin?.start()
+	let writeTransaction: AddWriteTransaction | null = null
+	let manifestSideEffectTransaction: AddManifestSideEffectTransaction | null = null
 
 	try {
+		// Pre-validate registry indexes before resolution (fail fast on incompatible formats)
+		// This catches legacy/incompatible registries before individual component fetches,
+		// providing actionable errors instead of confusing packument parse failures.
+		const requestedRegistries = new Set<string>()
+		for (const name of componentNames) {
+			const { namespace } = parseQualifiedComponent(name)
+			requestedRegistries.add(namespace)
+		}
+
+		for (const registryAlias of requestedRegistries) {
+			const registryConfig = effectiveRegistries[registryAlias]
+			if (registryConfig) {
+				await fetchRegistryIndex(registryConfig.url)
+			}
+		}
+
 		// Resolve all dependencies across all configured registries
-		const resolved = await resolveDependencies(registries, componentNames)
+		const resolved = await resolveDependencies(effectiveRegistries, componentNames)
 
 		if (options.verbose) {
 			logger.info("Install order:")
@@ -374,7 +567,7 @@ async function runRegistryAddCore(
 
 		// Fetch registry indexes once (Law 2: Parse at boundary)
 		const registryIndexes = new Map<string, RegistryIndex>()
-		const uniqueBaseUrls = new Map<string, string>() // namespace -> baseUrl
+		const uniqueBaseUrls = new Map<string, string>() // alias -> baseUrl
 
 		for (const component of resolved.components) {
 			if (!uniqueBaseUrls.has(component.registryName)) {
@@ -393,7 +586,7 @@ async function runRegistryAddCore(
 
 		// Version compatibility check (skip if disabled via flag)
 		const skipCompat = options.skipCompatCheck
-		if (!skipCompat) {
+		if (!skipCompat && !suppressHumanOutput) {
 			for (const [namespace, index] of registryIndexes) {
 				const issues = collectCompatIssues({
 					registry: { opencode: index.opencode, ocx: index.ocx },
@@ -404,21 +597,57 @@ async function runRegistryAddCore(
 		}
 
 		if (options.dryRun) {
-			logger.info("")
-			logger.info("Dry run - no changes made")
-			logResolved(resolved)
-			return
+			const actions: DryRunAction[] = resolved.components.map((component) => ({
+				action: "add",
+				target: `${component.registryName}/${component.name}`,
+				details: { type: component.type },
+			}))
+
+			// Add planned invalidation action if npm deps would change.
+			// NOTE: This may over-report in the edge case where the declared deps
+			// already match the existing package.json (no actual delta). This is
+			// acceptable for dry-run — it signals intent rather than guaranteeing
+			// change, and the real path uses computeDependencyDelta for precision.
+			if (resolved.npmDependencies.length > 0 || resolved.npmDevDependencies.length > 0) {
+				const packageDir = options.global || options.profile ? cwd : join(cwd, ".opencode")
+				const depNames = [...resolved.npmDependencies, ...resolved.npmDevDependencies]
+				const dryDeltaEntries = depNames.map((spec) => {
+					const lastAt = spec.lastIndexOf("@")
+					const name = lastAt > 0 ? spec.slice(0, lastAt) : spec
+					const version = lastAt > 0 ? spec.slice(lastAt + 1) : "*"
+					return { name, from: null as string | null, to: version }
+				})
+				actions.push(buildInvalidationDryRunAction(packageDir, dryDeltaEntries))
+			}
+
+			const dryRunResult: DryRunResult = {
+				dryRun: true,
+				command: "add",
+				wouldPerform: actions,
+				validation: { passed: true },
+				summary: `Would add ${resolved.components.length} component(s)`,
+			}
+
+			if (emitJson || !options.json) {
+				outputDryRun(dryRunResult, { json: options.json, quiet: options.quiet })
+			}
+			return {
+				installed: resolved.installOrder,
+				opencode: Boolean(resolved.opencode),
+				dryRun: true,
+			}
 		}
 
 		// Phase 1: Fetch all files and perform pre-flight checks (Law 4: Fail Fast)
 		// We check ALL conflicts BEFORE writing ANY files to ensure atomic behavior
-		const fetchSpin = options.quiet ? null : createSpinner({ text: "Fetching components..." })
+		const fetchSpin = suppressHumanOutput ? null : createSpinner({ text: "Fetching components..." })
 		fetchSpin?.start()
 
 		const componentBundles: {
 			component: ResolvedComponent
 			files: { path: string; content: Buffer }[]
 			computedHash: string
+			canonicalId: string
 		}[] = []
 
 		for (const component of resolved.components) {
@@ -433,90 +662,184 @@ async function runRegistryAddCore(
 
 			// Layer 2 path safety: Verify all target paths are inside cwd (runtime containment)
 			for (const file of component.files) {
-				const targetPath = join(cwd, resolveTargetPath(file.target, isFlattened))
-				assertPathInside(targetPath, cwd)
-			}
-
-			// Verify integrity if already in lock (use qualifiedName as key)
-			const existingEntry = lock.installed[component.qualifiedName]
-			if (existingEntry && existingEntry.hash !== computedHash) {
-				fetchSpin?.fail("Integrity check failed")
-				throw new IntegrityError(component.qualifiedName, existingEntry.hash, computedHash)
-			}
-
-			// Check for file conflicts with components from other namespaces
-			for (const file of component.files) {
-				const resolvedTarget = resolveTargetPath(file.target, isFlattened)
+				// V2: Resolve target path based on mode (flattened vs local)
+				const resolvedTarget = resolveTargetPath(file.target, isFlattened, cwd)
 				const targetPath = join(cwd, resolvedTarget)
-				if (existsSync(targetPath)) {
-					// File exists - check if it's from the same component (re-install) or different (conflict)
-					const conflictingComponent = findComponentByFile(lock, resolvedTarget)
-					if (conflictingComponent && conflictingComponent !== component.qualifiedName) {
-						fetchSpin?.fail("File conflict detected")
-						throw new ConflictError(
-							`File conflict: ${resolvedTarget} already exists (installed by '${conflictingComponent}').\n\n` +
-								`To resolve:\n` +
-								`  1. Remove existing: rm ${resolvedTarget}\n` +
-								`  2. Or rename it manually and update references\n` +
-								`  3. Then run: ocx add ${component.qualifiedName}`,
-						)
+				try {
+					validatePath(cwd, resolvedTarget)
+				} catch (error) {
+					if (error instanceof PathValidationError) {
+						throw new ValidationError(`Invalid path "${targetPath}": ${error.message}`)
 					}
+					throw error
 				}
 			}
 
-			componentBundles.push({ component, files, computedHash })
+			// V2: Check if already installed with canonical ID (use hash as revision)
+			// Integrity check: Look for ANY existing entry for this component (any revision)
+			// If found with different hash, fail - registry content changed unexpectedly
+			const existingEntries = Object.entries(receipt.installed).filter(
+				([_id, entry]) =>
+					normalizeRegistryUrl(entry.registryUrl) === normalizeRegistryUrl(component.baseUrl) &&
+					entry.registryName === component.registryName &&
+					entry.name === component.name,
+			)
+
+			if (existingEntries.length > 0) {
+				const existingPair = existingEntries[0]
+				if (existingPair) {
+					const [existingId, existingEntry] = existingPair
+					if (existingEntry.hash !== computedHash) {
+						fetchSpin?.fail("Integrity check failed")
+						throw new IntegrityError(existingId, existingEntry.hash, computedHash)
+					}
+					// Hash matches - component already installed, will be skipped later
+				}
+			}
+
+			// V2: Create canonical ID with hash-based revision
+			const canonicalId = createCanonicalId(
+				component.baseUrl,
+				component.registryName,
+				component.name,
+				`sha256:${computedHash}`,
+			)
+
+			componentBundles.push({ component, files, computedHash, canonicalId })
 		}
 
 		fetchSpin?.succeed(`Fetched ${resolved.components.length} components`)
 
 		// Phase 2: Pre-flight conflict detection (check ALL files before writing ANY)
 		// This ensures atomic behavior: either all files install or none do
-		const allConflicts: string[] = []
+		const plannedWrites = new Map<
+			string,
+			{
+				absolutePath: string
+				relativePath: string
+				content: Buffer
+				source: string
+			}
+		>()
 
 		for (const { component, files } of componentBundles) {
 			for (const file of files) {
 				const componentFile = component.files.find((f: ComponentFileObject) => f.path === file.path)
 				if (!componentFile) continue
 
-				const resolvedTarget = resolveTargetPath(componentFile.target, isFlattened)
+				const resolvedTarget = resolveTargetPath(componentFile.target, isFlattened, cwd)
 				const targetPath = join(cwd, resolvedTarget)
-				if (existsSync(targetPath)) {
-					const existingContent = await Bun.file(targetPath).text()
-					const incomingContent = file.content.toString("utf-8")
 
-					if (!isContentIdentical(existingContent, incomingContent) && !options.force) {
-						allConflicts.push(resolvedTarget)
-					}
-				}
+				registerPlannedWriteOrThrow(plannedWrites, {
+					absolutePath: targetPath,
+					relativePath: resolvedTarget,
+					content: file.content,
+					source: `${component.registryName}/${component.name}:${componentFile.path}`,
+				})
+			}
+		}
+
+		const allConflicts: Array<{ path: string; owningComponent: string | null }> = []
+
+		for (const plannedWrite of plannedWrites.values()) {
+			if (!existsSync(plannedWrite.absolutePath)) {
+				continue
+			}
+
+			const existingContent = await Bun.file(plannedWrite.absolutePath).text()
+			const incomingContent = plannedWrite.content.toString("utf-8")
+
+			if (!isContentIdentical(existingContent, incomingContent)) {
+				// Find which component owns this file (if any)
+				const owningComponent = findOwningComponent(receipt, plannedWrite.relativePath)
+				allConflicts.push({ path: plannedWrite.relativePath, owningComponent })
 			}
 		}
 
 		// Fail fast on conflicts BEFORE any writes (Law 4)
 		if (allConflicts.length > 0) {
-			logger.error("")
-			logger.error("File conflicts detected:")
-			for (const conflict of allConflicts) {
-				logger.error(`  ✗ ${conflict}`)
+			// Group conflicts by ownership
+			const ownedConflicts = allConflicts.filter((c) => c.owningComponent !== null)
+			const unownedConflicts = allConflicts.filter((c) => c.owningComponent === null)
+
+			if (!suppressHumanOutput) {
+				logger.error("")
+				logger.error("File conflicts detected:")
+
+				// Show owned conflicts with update suggestions
+				if (ownedConflicts.length > 0) {
+					logger.error("")
+					logger.error("Files from installed components (use 'ocx update' or 'ocx remove'):")
+					for (const conflict of ownedConflicts) {
+						// owningComponent is guaranteed non-null in ownedConflicts
+						if (conflict.owningComponent) {
+							const componentName = extractComponentName(conflict.owningComponent)
+							logger.error(`  ✗ ${conflict.path} (from ${componentName})`)
+						}
+					}
+				}
+
+				// Show unowned conflicts with manual resolution hint
+				if (unownedConflicts.length > 0) {
+					logger.error("")
+					logger.error("Files not managed by OCX (resolve manually):")
+					for (const conflict of unownedConflicts) {
+						logger.error(`  ✗ ${conflict.path}`)
+					}
+				}
+
+				logger.error("")
 			}
-			logger.error("")
-			logger.error("These files have been modified since installation.")
-			logger.error("Use --force to overwrite, or review the changes first.")
-			throw new ConflictError(
-				`${allConflicts.length} file(s) have conflicts. Use --force to overwrite.`,
-			)
+
+			// Build context-aware error message
+			let errorMessage = `${allConflicts.length} file(s) have conflicts.\n`
+
+			if (ownedConflicts.length > 0) {
+				// Extract unique component names
+				const uniqueComponents = new Set(
+					ownedConflicts
+						.filter((c) => c.owningComponent !== null)
+						.map((c) => extractComponentName(c.owningComponent as string)),
+				)
+				errorMessage += `For OCX-managed files, use 'ocx update ${Array.from(uniqueComponents).join(" ")}' or 'ocx remove ${Array.from(uniqueComponents).join(" ")}'.\n`
+			}
+
+			if (unownedConflicts.length > 0) {
+				errorMessage +=
+					"For unmanaged files, resolve conflicts manually by renaming or removing them."
+			}
+
+			throw new ConflictError(errorMessage.trim())
 		}
 
 		// Phase 3: Install all components (no conflicts possible at this point)
-		const installSpin = options.quiet ? null : createSpinner({ text: "Installing components..." })
+		const installSpin = suppressHumanOutput
+			? null
+			: createSpinner({ text: "Installing components..." })
 		installSpin?.start()
+		manifestSideEffectTransaction = await createAddManifestSideEffectTransaction({
+			cwd,
+			isFlattened,
+			trackOpencodeConfig: Boolean(resolved.opencode && Object.keys(resolved.opencode).length > 0),
+			trackNpmManifests:
+				resolved.npmDependencies.length > 0 || resolved.npmDevDependencies.length > 0,
+			quiet: options.quiet,
+		})
+		const installWriteTransaction = createAddWriteTransaction({ quiet: options.quiet })
+		writeTransaction = installWriteTransaction
 
-		for (const { component, files, computedHash } of componentBundles) {
+		for (const { component, files, computedHash, canonicalId } of componentBundles) {
 			// Install component
-			const installResult = await installComponent(component, files, cwd, {
-				force: options.force,
-				verbose: options.verbose,
+			const installResult = await installComponent(
+				component,
+				files,
+				cwd,
 				isFlattened,
-			})
+				installWriteTransaction,
+				{
+					verbose: options.verbose,
+				},
+			)
 
 			// Log results in verbose mode
 			if (options.verbose) {
@@ -531,7 +854,7 @@ async function runRegistryAddCore(
 				}
 			}
 
-			// Use cached registry index for lockfile version
+			// Use cached registry index
 			const index = registryIndexes.get(component.registryName)
 			if (!index) {
 				throw new ValidationError(
@@ -540,13 +863,28 @@ async function runRegistryAddCore(
 				)
 			}
 
-			// Update lock with qualifiedName as key (namespace/component format)
-			lock.installed[component.qualifiedName] = {
-				registry: component.registryName,
-				version: index.version,
+			// Compute individual file hashes (store resolved paths in receipt)
+			const fileHashes: Array<{ path: string; hash: string }> = []
+			for (const file of files) {
+				const componentFile = component.files.find((f: ComponentFileObject) => f.path === file.path)
+				if (!componentFile) throw new Error(`File ${file.path} not found in component manifest`)
+				const resolvedTarget = resolveTargetPath(componentFile.target, isFlattened, cwd)
+				fileHashes.push({
+					path: resolvedTarget, // Resolved path (with .opencode/ prefix if local mode)
+					hash: hashContent(file.content),
+				})
+			}
+
+			receipt.installed[canonicalId] = {
+				registryUrl: component.baseUrl,
+				registryName: component.registryName,
+				name: component.name,
+				revision: `sha256:${computedHash}`,
 				hash: computedHash,
-				files: component.files.map((f) => resolveTargetPath(f.target, isFlattened)),
+				files: fileHashes,
 				installedAt: new Date().toISOString(),
+				// Store component's opencode config for runtime instruction path resolution
+				...(component.opencode && { opencode: component.opencode as Record<string, unknown> }),
 			}
 		}
 
@@ -576,13 +914,15 @@ async function runRegistryAddCore(
 				: join(cwd, ".opencode/package.json")
 
 		if (hasNpmDeps || hasNpmDevDeps) {
-			const npmSpin = options.quiet
+			const npmSpin = suppressHumanOutput
 				? null
 				: createSpinner({ text: `Updating ${packageJsonPath}...` })
 			npmSpin?.start()
 
 			try {
-				await updateOpencodeDevDependencies(
+				// V2: Pass isFlattened based on mode (profile/global vs local)
+				const isFlattened = !!(options.global || options.profile)
+				const depResult = await updateOpencodePackageDeps(
 					cwd,
 					resolved.npmDependencies,
 					resolved.npmDevDependencies,
@@ -590,32 +930,67 @@ async function runRegistryAddCore(
 				)
 				const totalDeps = resolved.npmDependencies.length + resolved.npmDevDependencies.length
 				npmSpin?.succeed(`Added ${totalDeps} dependencies to ${packageJsonPath}`)
+
+				// Invalidate node_modules if dependencies changed to force reinstall
+				if (depResult.changed) {
+					const invResult = await invalidateNodeModules(depResult.packageDir)
+					if (invResult.success && invResult.action !== "none") {
+						if (!suppressHumanOutput) {
+							logger.info(
+								`Invalidated ${join(depResult.packageDir, "node_modules")} to force reinstall`,
+							)
+						}
+					} else if (!invResult.success) {
+						// Warn but do not fail the command (Law 5: intentional naming for remediation)
+						const nodeModulesPath = join(depResult.packageDir, "node_modules")
+						logger.warn(
+							`Could not invalidate ${nodeModulesPath}: ${invResult.error?.message ?? "unknown error"}. ` +
+								`Run \`rm -rf "${nodeModulesPath}"\` manually to force reinstall.`,
+						)
+					}
+				}
 			} catch (error) {
 				npmSpin?.fail(`Failed to update ${packageJsonPath}`)
 				throw error
 			}
 		}
 
-		// Save lock file
-		await writeOcxLock(cwd, lock, lockPath)
+		// V1: Save receipt file
+		await writeReceipt(cwd, receipt)
+		if (!writeTransaction) {
+			throw new Error("Internal error: missing add write transaction after install phase.")
+		}
+		await writeTransaction.commit()
+		writeTransaction = null
+		manifestSideEffectTransaction?.commit()
+		manifestSideEffectTransaction = null
 
-		if (options.json) {
-			console.log(
-				JSON.stringify(
-					{
-						success: true,
-						installed: resolved.installOrder,
-						opencode: !!resolved.opencode,
-					},
-					null,
-					2,
-				),
-			)
+		if (options.json && emitJson) {
+			outputJson({
+				success: true,
+				installed: resolved.installOrder,
+				opencode: !!resolved.opencode,
+			})
 		} else if (!options.quiet) {
 			logger.info("")
 			logger.success(`Done! Installed ${resolved.components.length} components.`)
 		}
+
+		return {
+			installed: resolved.installOrder,
+			opencode: !!resolved.opencode,
+			dryRun: false,
+		}
 	} catch (error) {
+		if (writeTransaction) {
+			await writeTransaction.rollback()
+			writeTransaction = null
+		}
+		if (manifestSideEffectTransaction) {
+			await manifestSideEffectTransaction.rollback()
+			manifestSideEffectTransaction = null
+		}
+
 		// Only fail the resolve spinner if it's still running (error during resolution)
 		// Other spinners handle their own failures
 		if (spin && !spin.isSpinning) {
@@ -628,6 +1003,311 @@ async function runRegistryAddCore(
 }
 
 /**
+ * Build a consistent warning message for rollback cleanup failures.
+ */
+function formatRollbackCleanupWarning(action: string, targetPath: string, error: unknown): string {
+	const errorMessage = error instanceof Error ? error.message : String(error)
+	return `${action} "${targetPath}" (${errorMessage})`
+}
+
+/**
+ * Returns true when candidate path is inside boundary directory.
+ */
+function isWithinBoundary(candidatePath: string, boundaryPath: string): boolean {
+	const rel = relative(boundaryPath, candidatePath)
+	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)
+}
+
+/**
+ * Remove empty parent directories up to (but not including) boundary.
+ */
+async function removeEmptyParentDirectories(startDir: string, boundaryDir: string): Promise<void> {
+	let currentDir = resolve(startDir)
+	const boundary = resolve(boundaryDir)
+
+	while (isWithinBoundary(currentDir, boundary)) {
+		let currentEntryExists = true
+		try {
+			const currentEntryStats = await lstat(currentDir)
+			if (!currentEntryStats.isDirectory()) {
+				// Never remove non-directory paths during cleanup.
+				break
+			}
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code === "ENOENT") {
+				currentEntryExists = false
+			} else {
+				throw error
+			}
+		}
+
+		try {
+			if (currentEntryExists) {
+				await rm(currentDir, { recursive: false })
+			}
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code === "ENOENT") {
+				// Already gone; continue walking upward.
+			} else if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EBUSY") {
+				// Stop at first non-empty/in-use directory.
+				break
+			} else if (code === "ENOTDIR") {
+				// Path changed to non-directory between lstat and rm.
+				break
+			} else {
+				throw error
+			}
+		}
+
+		const parentDir = dirname(currentDir)
+		if (parentDir === currentDir) {
+			break
+		}
+		currentDir = parentDir
+	}
+}
+
+/**
+ * Capture the current state of a file path for rollback.
+ */
+async function captureFileSnapshot(filePath: string): Promise<FileSnapshot> {
+	if (!existsSync(filePath)) {
+		return {
+			path: filePath,
+			existed: false,
+			content: "",
+		}
+	}
+
+	return {
+		path: filePath,
+		existed: true,
+		content: await Bun.file(filePath).text(),
+	}
+}
+
+/**
+ * Restore a file path to its captured state.
+ */
+async function restoreFileSnapshot(snapshot: FileSnapshot, cwd: string): Promise<void> {
+	if (snapshot.existed) {
+		await mkdir(dirname(snapshot.path), { recursive: true })
+		await Bun.write(snapshot.path, snapshot.content)
+		return
+	}
+
+	if (existsSync(snapshot.path)) {
+		await rm(snapshot.path, { force: true, recursive: true })
+	}
+
+	await removeEmptyParentDirectories(dirname(snapshot.path), cwd)
+}
+
+/**
+ * Snapshot manifest-side effect files so add can roll back atomically on failure.
+ */
+async function createAddManifestSideEffectTransaction(options: {
+	cwd: string
+	isFlattened: boolean
+	trackOpencodeConfig: boolean
+	trackNpmManifests: boolean
+	quiet?: boolean
+}): Promise<AddManifestSideEffectTransaction> {
+	const snapshots: FileSnapshot[] = []
+	const trackedPaths = new Set<string>()
+	let finalized = false
+
+	const trackPath = async (filePath: string): Promise<void> => {
+		if (trackedPaths.has(filePath)) {
+			return
+		}
+		trackedPaths.add(filePath)
+		snapshots.push(await captureFileSnapshot(filePath))
+	}
+
+	if (options.trackOpencodeConfig) {
+		const opencodeConfigPath = findOpencodeConfig(options.cwd).path
+		await trackPath(opencodeConfigPath)
+	}
+
+	if (options.trackNpmManifests) {
+		const packageDir = options.isFlattened ? options.cwd : join(options.cwd, ".opencode")
+		await trackPath(join(packageDir, "package.json"))
+		if (!options.isFlattened) {
+			await trackPath(join(packageDir, ".gitignore"))
+		}
+	}
+
+	await trackPath(findReceipt(options.cwd).path)
+
+	const rollback = async (): Promise<void> => {
+		if (finalized) {
+			return
+		}
+
+		finalized = true
+		const rollbackWarnings: string[] = []
+
+		for (const snapshot of [...snapshots].reverse()) {
+			try {
+				await restoreFileSnapshot(snapshot, options.cwd)
+			} catch (error) {
+				rollbackWarnings.push(
+					formatRollbackCleanupWarning(
+						"Add rollback cleanup warning: failed to restore",
+						snapshot.path,
+						error,
+					),
+				)
+			}
+		}
+
+		if (!options.quiet) {
+			for (const warning of rollbackWarnings) {
+				logger.warn(warning)
+			}
+		}
+	}
+
+	const commit = (): void => {
+		finalized = true
+	}
+
+	return { rollback, commit }
+}
+
+/**
+ * Creates an atomic write transaction for add installs.
+ * Files are swapped via temp+rename and can be rolled back on failure.
+ */
+function createAddWriteTransaction(options: { quiet?: boolean }): AddWriteTransaction {
+	const appliedWrites: AppliedAddWrite[] = []
+	const tempPaths = new Set<string>()
+	let finalized = false
+
+	const rollback = async (): Promise<void> => {
+		if (finalized) {
+			return
+		}
+
+		finalized = true
+		const rollbackWarnings: string[] = []
+
+		for (const tempPath of tempPaths) {
+			try {
+				await rm(tempPath, { force: true })
+			} catch (error) {
+				rollbackWarnings.push(
+					formatRollbackCleanupWarning(
+						"Add rollback cleanup warning: failed to remove temp file",
+						tempPath,
+						error,
+					),
+				)
+			}
+		}
+
+		for (const appliedWrite of [...appliedWrites].reverse()) {
+			try {
+				if (appliedWrite.backupPath) {
+					if (existsSync(appliedWrite.targetPath)) {
+						await rm(appliedWrite.targetPath, { force: true, recursive: true })
+					}
+					if (existsSync(appliedWrite.backupPath)) {
+						await rename(appliedWrite.backupPath, appliedWrite.targetPath)
+					}
+				} else if (existsSync(appliedWrite.targetPath)) {
+					await rm(appliedWrite.targetPath, { force: true, recursive: true })
+				}
+			} catch (error) {
+				rollbackWarnings.push(
+					formatRollbackCleanupWarning(
+						"Add rollback cleanup warning: failed to restore target",
+						appliedWrite.targetPath,
+						error,
+					),
+				)
+			}
+		}
+
+		if (!options.quiet) {
+			for (const warning of rollbackWarnings) {
+				logger.warn(warning)
+			}
+		}
+	}
+
+	const commit = async (): Promise<void> => {
+		if (finalized) {
+			return
+		}
+
+		finalized = true
+
+		for (const appliedWrite of appliedWrites) {
+			if (!appliedWrite.backupPath || !existsSync(appliedWrite.backupPath)) {
+				continue
+			}
+
+			try {
+				await rm(appliedWrite.backupPath, { force: true })
+			} catch (error) {
+				if (!options.quiet) {
+					const errorMessage = error instanceof Error ? error.message : String(error)
+					logger.warn(
+						`Post-add cleanup warning: failed to remove backup "${appliedWrite.backupPath}" (${errorMessage})`,
+					)
+				}
+			}
+		}
+	}
+
+	const writeFileAtomically: AddWriteTransaction["writeFileAtomically"] = async ({
+		targetPath,
+		resolvedTarget,
+		content,
+	}) => {
+		const targetDir = dirname(targetPath)
+		if (!existsSync(targetDir)) {
+			await mkdir(targetDir, { recursive: true })
+		}
+
+		if (existsSync(targetPath)) {
+			const targetStats = await stat(targetPath)
+			if (targetStats.isDirectory()) {
+				throw new ValidationError(`Cannot install "${resolvedTarget}": target path is a directory.`)
+			}
+		}
+
+		const tempPath = `${targetPath}.ocx-add-tmp-${randomUUID()}`
+		await writeFile(tempPath, content)
+		tempPaths.add(tempPath)
+
+		let backupPath: string | null = null
+		if (existsSync(targetPath)) {
+			backupPath = `${targetPath}.ocx-add-backup-${randomUUID()}`
+			await rename(targetPath, backupPath)
+			appliedWrites.push({ targetPath, backupPath })
+		}
+
+		await rename(tempPath, targetPath)
+		tempPaths.delete(tempPath)
+
+		if (!backupPath) {
+			appliedWrites.push({ targetPath, backupPath: null })
+		}
+	}
+
+	return {
+		writeFileAtomically,
+		rollback,
+		commit,
+	}
+}
+
+/**
  * Writes component files to disk.
  * Pre-flight conflict detection happens before this function is called,
  * so we can safely write all files without additional conflict checks.
@@ -636,7 +1316,9 @@ async function installComponent(
 	component: ResolvedComponent,
 	files: { path: string; content: Buffer }[],
 	cwd: string,
-	options: { force?: boolean; verbose?: boolean; isFlattened?: boolean },
+	isFlattened: boolean,
+	writeTransaction: AddWriteTransaction,
+	_options: { verbose?: boolean },
 ): Promise<{ written: string[]; skipped: string[]; overwritten: string[] }> {
 	const result = {
 		written: [] as string[],
@@ -648,10 +1330,9 @@ async function installComponent(
 		const componentFile = component.files.find((f: ComponentFileObject) => f.path === file.path)
 		if (!componentFile) continue
 
-		const resolvedTarget = resolveTargetPath(componentFile.target, !!options.isFlattened)
+		// V2: Resolve target path based on mode (flattened vs local)
+		const resolvedTarget = resolveTargetPath(componentFile.target, isFlattened, cwd)
 		const targetPath = join(cwd, resolvedTarget)
-		const targetDir = dirname(targetPath)
-
 		// Check if file exists
 		if (existsSync(targetPath)) {
 			// Read existing content and compare
@@ -670,66 +1351,14 @@ async function installComponent(
 			result.written.push(resolvedTarget)
 		}
 
-		// Create directory if needed
-		if (!existsSync(targetDir)) {
-			await mkdir(targetDir, { recursive: true })
-		}
-
-		await writeFile(targetPath, file.content)
+		await writeTransaction.writeFileAtomically({
+			targetPath,
+			resolvedTarget,
+			content: file.content,
+		})
 	}
 
 	return result
-}
-
-async function hashContent(content: string | Buffer): Promise<string> {
-	return createHash("sha256").update(content).digest("hex")
-}
-
-async function hashBundle(files: { path: string; content: Buffer }[]): Promise<string> {
-	// Sort files for deterministic hashing
-	const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path))
-
-	// Create a manifest of file hashes
-	const manifestParts: string[] = []
-	for (const file of sorted) {
-		const hash = await hashContent(file.content)
-		manifestParts.push(`${file.path}:${hash}`)
-	}
-
-	// Hash the manifest itself
-	return hashContent(manifestParts.join("\n"))
-}
-
-function logResolved(resolved: ResolvedDependencies): void {
-	logger.info("")
-	logger.info("Would install:")
-	for (const component of resolved.components) {
-		logger.info(`  ${component.name} (${component.type}) from ${component.registryName}`)
-	}
-
-	if (resolved.opencode && Object.keys(resolved.opencode).length > 0) {
-		logger.info("")
-		logger.info("Would update opencode.json with:")
-		for (const key of Object.keys(resolved.opencode)) {
-			logger.info(`  ${key}`)
-		}
-	}
-
-	if (resolved.npmDependencies.length > 0) {
-		logger.info("")
-		logger.info("Would install npm dependencies:")
-		for (const dep of resolved.npmDependencies) {
-			logger.info(`  ${dep}`)
-		}
-	}
-
-	if (resolved.npmDevDependencies.length > 0) {
-		logger.info("")
-		logger.info("Would install npm dev dependencies:")
-		for (const dep of resolved.npmDevDependencies) {
-			logger.info(`  ${dep}`)
-		}
-	}
 }
 
 // ============================================================================
@@ -783,7 +1412,22 @@ function parseNpmDependency(spec: string): NpmDependency {
 }
 
 /**
- * Merges new dependencies into existing package.json structure.
+ * Merges new dependencies into the dependencies field.
+ * Pure function: same inputs always produce same output.
+ */
+function mergeProdDependencies(
+	existing: OpencodePackageJson,
+	newDeps: NpmDependency[],
+): OpencodePackageJson {
+	const merged: Record<string, string> = { ...existing.dependencies }
+	for (const dep of newDeps) {
+		merged[dep.name] = dep.version
+	}
+	return { ...existing, dependencies: merged }
+}
+
+/**
+ * Merges new devDependencies into the devDependencies field.
  * Pure function: same inputs always produce same output.
  */
 function mergeDevDependencies(
@@ -851,49 +1495,66 @@ async function ensureManifestFilesAreTracked(opencodeDir: string): Promise<void>
 }
 
 /**
- * Updates package.json with new devDependencies.
+ * Updates package.json with new dependencies.
  * For local mode: writes to .opencode/package.json and ensures git tracking.
  * For flattened mode (global or profile): writes directly to cwd/package.json.
+ *
+ * Returns metadata about what changed for downstream invalidation logic.
+ *
+ * @throws ConflictError if same package appears in both prod and dev deps
  */
-async function updateOpencodeDevDependencies(
+async function updateOpencodePackageDeps(
 	cwd: string,
 	npmDeps: string[],
 	npmDevDeps: string[],
 	options: { isFlattened?: boolean } = {},
-): Promise<void> {
-	// Guard: no deps to process
-	const allDepSpecs = [...npmDeps, ...npmDevDeps]
-	if (allDepSpecs.length === 0) return
-
+): Promise<DepUpdateResult> {
 	// Flattened mode: write directly to cwd, no .opencode prefix
 	// Local mode: write to .opencode subdirectory
 	const packageDir = options.isFlattened ? cwd : join(cwd, ".opencode")
 
+	// Guard: no deps to process
+	if (npmDeps.length === 0 && npmDevDeps.length === 0) {
+		return { changed: false, packageDir, delta: [] }
+	}
+
 	// Ensure directory exists
 	await mkdir(packageDir, { recursive: true })
 
-	// Parse all deps - fails fast on invalid
-	const parsedDeps = allDepSpecs.map(parseNpmDependency)
+	// Parse all deps - fails fast on invalid (Law 4)
+	const prodDeps = npmDeps.map(parseNpmDependency)
+	const devDeps = npmDevDeps.map(parseNpmDependency)
+
+	// Law 4 (Fail Loud): Check for conflicts - same package in both lists
+	const prodNames = new Set(prodDeps.map((d) => d.name))
+	const conflicts = devDeps.filter((d) => prodNames.has(d.name))
+	if (conflicts.length > 0) {
+		throw new ConflictError(
+			`Package(s) appear in both dependencies and devDependencies: ${conflicts.map((c) => c.name).join(", ")}.\n` +
+				"A package cannot be in both fields. Remove from one list manually before adding.",
+		)
+	}
 
 	// Read → merge → write
 	const existing = await readOpencodePackageJson(packageDir)
-	const updated = mergeDevDependencies(existing, parsedDeps)
+	const beforeDeps = { ...existing.dependencies, ...existing.devDependencies }
+
+	let updated = existing
+	updated = mergeProdDependencies(updated, prodDeps)
+	updated = mergeDevDependencies(updated, devDeps)
 	await Bun.write(join(packageDir, "package.json"), `${JSON.stringify(updated, null, 2)}\n`)
+
+	const afterDeps = { ...updated.dependencies, ...updated.devDependencies }
+	const delta = computeDependencyDelta(beforeDeps, afterDeps)
 
 	// Ensure manifest files are tracked by git (only for local mode)
 	if (!options.isFlattened) {
 		await ensureManifestFilesAreTracked(packageDir)
 	}
-}
 
-/**
- * Find which component installed a given file path
- */
-function findComponentByFile(lock: OcxLock, filePath: string): string | null {
-	for (const [qualifiedName, entry] of Object.entries(lock.installed)) {
-		if (entry.files.includes(filePath)) {
-			return qualifiedName
-		}
+	return {
+		changed: delta.changed,
+		packageDir,
+		delta: delta.entries,
 	}
-	return null
 }

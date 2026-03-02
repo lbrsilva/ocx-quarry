@@ -1,5 +1,39 @@
-import { describe, expect, it, mock } from "bun:test"
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { createHash } from "node:crypto"
+import { mkdir, writeFile } from "node:fs/promises"
+import { dirname, join } from "node:path"
 import { Command } from "commander"
+import { cleanupTempDir, createTempDir } from "../helpers"
+
+const SELF_UPDATE_COMMAND_MODULE_PATH = require.resolve("../../src/commands/self/update.js")
+const SELF_UPDATE_CHECK_MODULE_PATH = require.resolve("../../src/self-update/check.js")
+const SELF_UPDATE_DETECT_METHOD_MODULE_PATH = require.resolve(
+	"../../src/self-update/detect-method.js",
+)
+const SELF_UPDATE_VERIFY_MODULE_PATH = require.resolve("../../src/self-update/verify.js")
+const SELF_UPDATE_NOTIFY_MODULE_PATH = require.resolve("../../src/self-update/notify.js")
+const SPINNER_MODULE_PATH = require.resolve("../../src/utils/spinner.js")
+
+const SELF_UPDATE_MOCKED_MODULE_PATHS = [
+	SELF_UPDATE_COMMAND_MODULE_PATH,
+	SELF_UPDATE_CHECK_MODULE_PATH,
+	SELF_UPDATE_DETECT_METHOD_MODULE_PATH,
+	SELF_UPDATE_VERIFY_MODULE_PATH,
+	SELF_UPDATE_NOTIFY_MODULE_PATH,
+	SPINNER_MODULE_PATH,
+]
+
+function clearSelfUpdateModuleCache(): void {
+	for (const modulePath of SELF_UPDATE_MOCKED_MODULE_PATHS) {
+		delete require.cache[modulePath]
+	}
+}
+
+async function importSelfUpdateCommandModule() {
+	clearSelfUpdateModuleCache()
+	const uniqueId = Bun.randomUUIDv7()
+	return import(`../../src/commands/self/update.js?test=${uniqueId}`)
+}
 
 // =============================================================================
 // Tests for postAction Hook Behavior
@@ -134,8 +168,9 @@ describe("postAction hook behavior", () => {
 		 * - `actionCommand`: The actual leaf command that was executed ("update")
 		 */
 		it("actionCommand parameter is the leaf command, not the hook registration point", async () => {
-			let capturedThisCommand: Command | null = null
-			let capturedActionCommand: Command | null = null
+			let capturedThisCommandName = ""
+			let capturedActionCommandName = ""
+			let capturedActionParentName = ""
 
 			const program = new Command()
 			program.name("ocx")
@@ -151,28 +186,25 @@ describe("postAction hook behavior", () => {
 				})
 
 			// Capture both parameters in the hook
-			program.hook("postAction", (thisCommand, actionCommand) => {
-				capturedThisCommand = thisCommand
-				capturedActionCommand = actionCommand
+			program.hook("postAction", (thisCommand: Command, actionCommand: Command) => {
+				capturedThisCommandName = String(thisCommand.name())
+				capturedActionCommandName = String(actionCommand.name())
+				capturedActionParentName = String(actionCommand.parent?.name() ?? "")
 			})
 
 			// Execute "self update"
 			await program.parseAsync(["node", "ocx", "self", "update"])
 
-			// Verify captured commands
-			expect(capturedThisCommand).not.toBeNull()
-			expect(capturedActionCommand).not.toBeNull()
-
 			// thisCommand is the ROOT program (where hook was registered)
 			// It is NOT "update" - this proves the hook registration point vs execution point
-			expect(capturedThisCommand?.name()).toBe("ocx")
-			expect(capturedThisCommand?.name()).not.toBe("update")
+			expect(capturedThisCommandName).toBe("ocx")
+			expect(capturedThisCommandName).not.toBe("update")
 
 			// actionCommand IS the leaf "update" command that was executed
-			expect(capturedActionCommand?.name()).toBe("update")
+			expect(capturedActionCommandName).toBe("update")
 
 			// actionCommand's parent IS "self" - this enables our skip logic
-			expect(capturedActionCommand?.parent?.name()).toBe("self")
+			expect(capturedActionParentName).toBe("self")
 		})
 
 		/**
@@ -183,7 +215,9 @@ describe("postAction hook behavior", () => {
 		 * future skip conditions that might need deeper nesting checks.
 		 */
 		it("actionCommand.parent provides the direct parent command", async () => {
-			let capturedActionCommand: Command | null = null
+			let capturedActionName = ""
+			let capturedParentName = ""
+			let capturedGrandparentName = ""
 
 			const program = new Command()
 			program.name("ocx")
@@ -196,16 +230,149 @@ describe("postAction hook behavior", () => {
 				.description("Show config")
 				.action(() => {})
 
-			program.hook("postAction", (_thisCommand, actionCommand) => {
-				capturedActionCommand = actionCommand
+			program.hook("postAction", (_thisCommand: Command, actionCommand: Command) => {
+				capturedActionName = String(actionCommand.name())
+				capturedParentName = String(actionCommand.parent?.name() ?? "")
+				capturedGrandparentName = String(actionCommand.parent?.parent?.name() ?? "")
 			})
 
 			await program.parseAsync(["node", "ocx", "config", "show"])
 
-			expect(capturedActionCommand).not.toBeNull()
-			expect(capturedActionCommand?.name()).toBe("show")
-			expect(capturedActionCommand?.parent?.name()).toBe("config")
-			expect(capturedActionCommand?.parent?.parent?.name()).toBe("ocx")
+			expect(capturedActionName).toBe("show")
+			expect(capturedParentName).toBe("config")
+			expect(capturedGrandparentName).toBe("ocx")
 		})
+	})
+})
+
+describe("self update --json curl strict output", () => {
+	let testDir: string | undefined
+	const originalFetch = global.fetch
+
+	function getRequestUrl(input: string | URL | Request): string {
+		if (typeof input === "string") return input
+		if (input instanceof URL) return input.toString()
+		return input.url
+	}
+
+	async function cleanup(): Promise<void> {
+		mock.restore()
+		clearSelfUpdateModuleCache()
+		global.fetch = originalFetch
+		if (testDir) {
+			await cleanupTempDir(testDir)
+			testDir = undefined
+		}
+	}
+
+	afterEach(async () => {
+		await cleanup()
+	})
+
+	afterAll(async () => {
+		await cleanup()
+	})
+
+	it("emits one JSON payload and suppresses curl spinner output", async () => {
+		testDir = await createTempDir("self-update-json-curl")
+		const executablePath = join(testDir, "bin", "ocx")
+
+		await mkdir(dirname(executablePath), { recursive: true })
+		await writeFile(executablePath, "old-binary")
+
+		const createSpinnerMock = mock(() => ({
+			start: mock(() => {}),
+			fail: mock(() => {}),
+			succeed: mock(() => {}),
+			text: "",
+		}))
+		const notifyUpdatedMock = mock(() => {})
+
+		mock.module("../../src/self-update/check.js", () => ({
+			EXPLICIT_UPDATE_TIMEOUT_MS: 10_000,
+			checkForUpdate: mock(async () => ({
+				ok: true,
+				current: "1.0.0",
+				latest: "1.1.0",
+				updateAvailable: true,
+			})),
+		}))
+
+		// Re-export the real detect-method module, only overriding
+		// getExecutablePath to point at the test temp directory.
+		// The "?real" query-string cache-buster bypasses any prior
+		// mock.module registration so we always get the genuine exports.
+		const realDetectMethod = require("../../src/self-update/detect-method.js?real")
+		mock.module("../../src/self-update/detect-method.js", () => ({
+			...realDetectMethod,
+			getExecutablePath: () => executablePath,
+		}))
+
+		mock.module("../../src/self-update/notify.js", () => ({
+			notifyUpdated: notifyUpdatedMock,
+			notifyUpToDate: mock(() => {}),
+		}))
+
+		mock.module("../../src/utils/spinner.js", () => ({
+			createSpinner: createSpinnerMock,
+		}))
+
+		const downloadedBytes = new Uint8Array([1, 2, 3])
+		const downloadedBinaryHash = createHash("sha256").update(downloadedBytes).digest("hex")
+		const checksumsContent = [
+			`${downloadedBinaryHash}  ocx-darwin-arm64`,
+			`${downloadedBinaryHash}  ocx-darwin-x64`,
+			`${downloadedBinaryHash}  ocx-linux-arm64`,
+			`${downloadedBinaryHash}  ocx-linux-x64`,
+			`${downloadedBinaryHash}  ocx-windows-x64.exe`,
+			"",
+		].join("\n")
+
+		spyOn(global, "fetch").mockImplementation(
+			mock(async (input: string | URL | Request) => {
+				const url = getRequestUrl(input)
+
+				if (url.endsWith("/SHA256SUMS.txt")) {
+					return new Response(checksumsContent, {
+						status: 200,
+						headers: { "content-type": "text/plain" },
+					})
+				}
+
+				if (url.includes("/releases/download/")) {
+					return new Response(downloadedBytes, {
+						status: 200,
+						headers: { "content-length": String(downloadedBytes.length) },
+					})
+				}
+
+				throw new Error(`Unexpected fetch URL in test: ${url}`)
+			}) as unknown as typeof fetch,
+		)
+
+		const consoleLogSpy = spyOn(console, "log").mockImplementation(() => {})
+		const consoleErrorSpy = spyOn(console, "error").mockImplementation(() => {})
+
+		const { registerSelfUpdateCommand } = await importSelfUpdateCommandModule()
+
+		const program = new Command()
+		const selfCommand = program.command("self")
+		registerSelfUpdateCommand(selfCommand)
+
+		await program.parseAsync(["node", "ocx", "self", "update", "--json", "--method", "curl"])
+
+		expect(createSpinnerMock).not.toHaveBeenCalled()
+		expect(notifyUpdatedMock).not.toHaveBeenCalled()
+		expect(consoleErrorSpy).not.toHaveBeenCalled()
+		expect(consoleLogSpy).toHaveBeenCalledTimes(1)
+
+		const payload = JSON.parse(String(consoleLogSpy.mock.calls[0]?.[0] ?? "")) as {
+			success: boolean
+			data?: { method?: string; updated?: boolean }
+		}
+
+		expect(payload.success).toBe(true)
+		expect(payload.data?.method).toBe("curl")
+		expect(payload.data?.updated).toBe(true)
 	})
 })

@@ -12,7 +12,7 @@ import type { ConfigProvider } from "../config/provider"
 import { LocalConfigProvider } from "../config/provider"
 import { ConfigResolver } from "../config/resolver"
 import { fetchRegistryIndex } from "../registry/fetcher"
-import { readOcxLock } from "../schemas/config"
+import { readReceipt } from "../schemas"
 import { createSpinner, handleError, logger, outputJson } from "../utils/index"
 import { addCommonOptions, addVerboseOption } from "../utils/shared-options"
 
@@ -46,11 +46,9 @@ export function registerSearchCommand(program: Command): void {
 		.alias("list")
 		.description("Search for components across registries or list installed")
 		.argument("[query]", "Search query")
-		.option("-i, --installed", "List installed components only", false)
+		.option("--installed", "List installed components only", false)
 		.option("-p, --profile <name>", "Use specific profile")
-		.addOption(
-			new Option("-l, --limit <n>", "Limit results").default(20).argParser(parsePositiveInt),
-		)
+		.addOption(new Option("--limit <n>", "Limit results").default(20).argParser(parsePositiveInt))
 
 	addCommonOptions(cmd)
 	addVerboseOption(cmd)
@@ -59,8 +57,8 @@ export function registerSearchCommand(program: Command): void {
 		try {
 			// List installed only
 			if (options.installed) {
-				const lock = await readOcxLock(options.cwd)
-				if (!lock) {
+				const receipt = await readReceipt(options.cwd)
+				if (!receipt || Object.keys(receipt.installed).length === 0) {
 					if (options.json) {
 						outputJson({ success: true, data: { components: [] } })
 					} else {
@@ -69,11 +67,11 @@ export function registerSearchCommand(program: Command): void {
 					return
 				}
 
-				const installed = Object.entries(lock.installed).map(([name, info]) => ({
-					name,
-					registry: info.registry,
-					version: info.version,
-					installedAt: info.installedAt,
+				const installed = Object.entries(receipt.installed).map(([_canonicalId, info]) => ({
+					name: `${info.registryName}/${info.name}`,
+					registry: info.registryUrl,
+					version: info.revision,
+					installedAt: undefined, // V2 receipt doesn't track installedAt
 				}))
 
 				if (options.json) {
@@ -153,7 +151,7 @@ export async function runSearchCore(
 			}
 			for (const comp of index.components) {
 				allComponents.push({
-					name: `${index.namespace}/${comp.name}`,
+					name: `${registryName}/${comp.name}`,
 					description: comp.description,
 					type: comp.type,
 					registry: registryName,

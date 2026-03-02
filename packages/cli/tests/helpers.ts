@@ -20,6 +20,8 @@ export interface RunCLIOptions {
 	env?: Record<string, string | undefined>
 	/** Use isolated environment (allowlist-only, requires XDG_CONFIG_HOME in env) */
 	isolated?: boolean
+	/** Timeout in milliseconds (default: 10000) */
+	timeout?: number
 }
 
 /**
@@ -73,6 +75,7 @@ export async function runCLI(
 	options?: RunCLIOptions,
 ): Promise<CLIResult> {
 	const indexPath = join(import.meta.dir, "..", "src/index.ts")
+	const timeout = options?.timeout ?? 10000 // 10s default
 
 	// Ensure cwd exists
 	await mkdir(cwd, { recursive: true })
@@ -91,12 +94,41 @@ export async function runCLI(
 	})
 
 	// Read stdout and stderr in parallel
-	const [stdout, stderr] = await Promise.all([
+	const outputPromise = Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 	])
 
-	const exitCode = await proc.exited
+	// Race between process exit and timeout
+	let exitCode: number
+	let timedOut = false
+
+	try {
+		exitCode = await Promise.race([
+			proc.exited,
+			new Promise<never>((_, reject) =>
+				setTimeout(() => {
+					timedOut = true
+					proc.kill()
+					reject(new Error(`CLI timeout after ${timeout}ms`))
+				}, timeout),
+			),
+		])
+	} catch (error) {
+		if (timedOut) {
+			// Return a result indicating timeout rather than throwing
+			const [stdout, stderr] = await outputPromise.catch(() => ["", ""])
+			return {
+				stdout,
+				stderr,
+				output: `${stdout + stderr}\n[TIMEOUT after ${timeout}ms]`,
+				exitCode: 124, // Standard timeout exit code
+			}
+		}
+		throw error
+	}
+
+	const [stdout, stderr] = await outputPromise
 
 	return {
 		stdout,
@@ -261,6 +293,140 @@ export function expectJsonError(output: string, options: ExpectJsonErrorOptions)
 	}
 
 	return parsed
+}
+
+export type StrictJsonPayload = Record<string, unknown>
+type StrictJsonChannel = "stdout" | "stderr"
+
+function resolveStrictJsonChannel(result: CLIResult): {
+	channel: StrictJsonChannel
+	output: string
+} {
+	const hasStdout = result.stdout.trim().length > 0
+	const hasStderr = result.stderr.trim().length > 0
+
+	if (hasStdout && hasStderr) {
+		throw new Error(
+			`strict JSON policy violation: expected exactly one output channel, but both stdout and stderr have content.\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n--------------`,
+		)
+	}
+
+	if (!hasStdout && !hasStderr) {
+		throw new Error(
+			"strict JSON policy violation: expected JSON output on stdout or stderr, but both channels are empty.",
+		)
+	}
+
+	if (hasStdout) {
+		return { channel: "stdout", output: result.stdout }
+	}
+
+	return { channel: "stderr", output: result.stderr }
+}
+
+/**
+ * Assert output channel is exactly one valid JSON document.
+ * Rejects empty output and any human prefix/suffix text.
+ */
+export function expectStrictJsonStdout(
+	output: string,
+	channel: StrictJsonChannel = "stdout",
+): StrictJsonPayload {
+	const trimmed = output.trim()
+	expect(trimmed.length).toBeGreaterThan(0)
+
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(trimmed)
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		throw new Error(
+			`${channel} must be exactly one valid JSON document. Parse failed: ${message}\n--- ${channel} ---\n${output}\n--------------`,
+		)
+	}
+
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`${channel} JSON must be an object. Received: ${JSON.stringify(parsed)}`)
+	}
+
+	return parsed as StrictJsonPayload
+}
+
+/**
+ * Strict JSON success contract:
+ * - exitCode = 0
+ * - exactly one output channel contains JSON (stdout or stderr)
+ * - payload includes success: true
+ */
+export function expectStrictJsonSuccess(result: CLIResult): StrictJsonPayload {
+	expect(result.exitCode).toBe(0)
+
+	const { channel, output } = resolveStrictJsonChannel(result)
+	const payload = expectStrictJsonStdout(output, channel)
+	expect((payload as { success?: unknown }).success).toBe(true)
+	return payload
+}
+
+/**
+ * Strict JSON failure contract:
+ * - exitCode is non-zero
+ * - exactly one output channel contains JSON (stdout or stderr)
+ * - payload includes success: false and either:
+ *   - an error object (code + message), or
+ *   - blockers[] with at least one structured blocker (code + message + path)
+ */
+export function expectStrictJsonFailure(result: CLIResult): StrictJsonPayload {
+	expect(result.exitCode).not.toBe(0)
+
+	const { channel, output } = resolveStrictJsonChannel(result)
+	const payload = expectStrictJsonStdout(output, channel)
+	expect((payload as { success?: unknown }).success).toBe(false)
+
+	const expectNonBlankString = (value: unknown): string => {
+		expect(typeof value).toBe("string")
+		const typedValue = value as string
+		expect(typedValue.trim().length).toBeGreaterThan(0)
+		return typedValue
+	}
+
+	let validatedFailureShape = false
+
+	const errorPayload = (payload as { error?: unknown }).error
+	if (errorPayload !== undefined) {
+		expect(typeof errorPayload).toBe("object")
+		expect(errorPayload).not.toBeNull()
+
+		const typedError = errorPayload as { code?: unknown; message?: unknown }
+		expectNonBlankString(typedError.code)
+		expectNonBlankString(typedError.message)
+		validatedFailureShape = true
+	}
+
+	const blockers = (payload as { blockers?: unknown }).blockers
+	if (blockers !== undefined) {
+		expect(Array.isArray(blockers)).toBe(true)
+		const blockerList = blockers as unknown[]
+		expect(blockerList.length).toBeGreaterThan(0)
+
+		for (const blocker of blockerList) {
+			expect(typeof blocker).toBe("object")
+			expect(blocker).not.toBeNull()
+			const typedBlocker = blocker as { code?: unknown; message?: unknown; path?: unknown }
+			expectNonBlankString(typedBlocker.code)
+			expectNonBlankString(typedBlocker.message)
+			expectNonBlankString(typedBlocker.path)
+		}
+
+		validatedFailureShape = true
+	}
+
+	if (!validatedFailureShape) {
+		throw new Error(
+			"strict JSON failure payload must include a non-empty error object or blockers array.",
+		)
+	}
+
+	return payload
 }
 
 /**

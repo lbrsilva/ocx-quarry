@@ -1,8 +1,8 @@
 {
 	"$schema": "http://json-schema.org/draft-07/schema#",
-	"$id": "https://ocx.kdco.dev/ocx.schema.json",
+	"$id": "https://ocx.kdco.dev/schemas/ocx.json",
 	"title": "OCX Global Configuration Schema",
-	"description": "Schema for the global OCX configuration file at ~/.config/opencode/ocx.jsonc. This config is modified by commands using the --global flag and applies as the base configuration for all projects.",
+	"description": "Schema for the global OCX configuration file at ~/.config/opencode/ocx.jsonc (OCX V2). This config is modified by commands using the --global flag. Registry commands are local-first; --global is required for global writes.",
 	"type": "object",
 	"properties": {
 		"$schema": {
@@ -21,10 +21,6 @@
 						"type": "string",
 						"format": "uri",
 						"description": "The base URL of the registry"
-					},
-					"version": {
-						"type": "string",
-						"description": "Optional version pin for this registry"
 					},
 					"headers": {
 						"type": "object",

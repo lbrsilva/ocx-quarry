@@ -1,7 +1,18 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test"
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test"
 import { existsSync } from "node:fs"
-import { readFile, writeFile } from "node:fs/promises"
+import * as fsPromises from "node:fs/promises"
+import {
+	rename as fsRename,
+	rm as fsRm,
+	mkdir,
+	readdir,
+	readFile,
+	writeFile,
+} from "node:fs/promises"
 import { join } from "node:path"
+import { resolveUpdateFailureMessage, runUpdateCore } from "../src/commands/update"
+import { LocalConfigProvider } from "../src/config/provider"
+import { _clearFetcherCacheForTests } from "../src/registry/fetcher"
 import { cleanupTempDir, createTempDir, parseJsonc, runCLI } from "./helpers"
 import { type MockRegistry, startMockRegistry } from "./mock-registry"
 
@@ -28,7 +39,7 @@ describe("ocx update", () => {
 	 */
 	async function setupProject(name: string): Promise<string> {
 		const dir = await createTempDir(name)
-		await runCLI(["init", "--force"], dir)
+		await runCLI(["init"], dir)
 
 		const configPath = join(dir, ".opencode", "ocx.jsonc")
 		const config = parseJsonc(await readFile(configPath, "utf-8")) as Record<string, unknown>
@@ -44,7 +55,7 @@ describe("ocx update", () => {
 	 * Helper to install a component
 	 */
 	async function installComponent(dir: string, componentName: string): Promise<void> {
-		const { exitCode, output } = await runCLI(["add", componentName, "--force"], dir)
+		const { exitCode, output } = await runCLI(["add", componentName], dir)
 		if (exitCode !== 0) {
 			throw new Error(`Failed to install ${componentName}: ${output}`)
 		}
@@ -61,13 +72,14 @@ describe("ocx update", () => {
 		await installComponent(testDir, "kdco/test-plugin")
 
 		// Verify initial content
-		const filePath = join(testDir, ".opencode/plugin/test-plugin.ts")
+		const filePath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
 		const originalContent = await readFile(filePath, "utf-8")
 		expect(originalContent).toContain("test-plugin")
 
 		// Change registry content to simulate update
 		const newContent = "// Updated content for test-plugin v2"
 		registry.setFileContent("test-plugin", "index.ts", newContent)
+		_clearFetcherCacheForTests() // Clear cache to ensure fresh fetch
 
 		// Run update
 		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
@@ -79,11 +91,14 @@ describe("ocx update", () => {
 		const updatedContent = await readFile(filePath, "utf-8")
 		expect(updatedContent).toBe(newContent)
 
-		// Verify lock file was updated
-		const lockPath = join(testDir, ".opencode/ocx.lock")
-		const lock = parseJsonc(await readFile(lockPath, "utf-8")) as Record<string, unknown>
-		const installed = lock.installed as Record<string, { updatedAt?: string }>
-		expect(installed["kdco/test-plugin"].updatedAt).toBeDefined()
+		// Verify receipt was updated (V1: .ocx/receipt.jsonc)
+		const receiptPath = join(testDir, ".ocx/receipt.jsonc")
+		const receipt = parseJsonc(await readFile(receiptPath, "utf-8")) as Record<string, unknown>
+		const installed = receipt.installed as Record<string, { updatedAt?: string }>
+		// V2: Receipt uses canonical IDs, find entry containing test-plugin
+		const pluginEntry = Object.entries(installed).find(([id]) => id.includes("test-plugin"))
+		expect(pluginEntry).toBeDefined()
+		expect(pluginEntry?.[1].updatedAt).toBeDefined()
 	})
 
 	// =========================================================================
@@ -108,11 +123,14 @@ describe("ocx update", () => {
 		expect(output).toContain("Updated")
 
 		// Verify both files were updated
-		const pluginContent = await readFile(join(testDir, ".opencode/plugin/test-plugin.ts"), "utf-8")
+		const pluginContent = await readFile(
+			join(testDir, ".opencode", "plugins", "test-plugin.ts"),
+			"utf-8",
+		)
 		expect(pluginContent).toBe("// Plugin v2")
 
 		const skillContent = await readFile(
-			join(testDir, ".opencode/skills/test-skill/SKILL.md"),
+			join(testDir, ".opencode", "skills", "test-skill", "SKILL.md"),
 			"utf-8",
 		)
 		expect(skillContent).toBe("# Skill v2")
@@ -129,7 +147,7 @@ describe("ocx update", () => {
 		await installComponent(testDir, "kdco/test-plugin")
 
 		// Record original content
-		const filePath = join(testDir, ".opencode/plugin/test-plugin.ts")
+		const filePath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
 		const originalContent = await readFile(filePath, "utf-8")
 
 		// Change registry content
@@ -170,10 +188,10 @@ describe("ocx update", () => {
 		await installComponent(testDir, "kdco/test-plugin")
 
 		// Record original content
-		const filePath = join(testDir, ".opencode/plugin/test-plugin.ts")
+		const filePath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
 		const originalContent = await readFile(filePath, "utf-8")
-		const lockPath = join(testDir, ".opencode/ocx.lock")
-		const originalLock = await readFile(lockPath, "utf-8")
+		const receiptPath = join(testDir, ".ocx/receipt.jsonc")
+		const originalReceipt = await readFile(receiptPath, "utf-8")
 
 		// Change registry content
 		registry.setFileContent("test-plugin", "index.ts", "// Dry run change")
@@ -188,9 +206,9 @@ describe("ocx update", () => {
 		const currentContent = await readFile(filePath, "utf-8")
 		expect(currentContent).toBe(originalContent)
 
-		// Verify lock was NOT modified
-		const currentLock = await readFile(lockPath, "utf-8")
-		expect(currentLock).toBe(originalLock)
+		// Verify receipt was NOT modified
+		const currentReceipt = await readFile(receiptPath, "utf-8")
+		expect(currentReceipt).toBe(originalReceipt)
 	})
 
 	it("should output JSON with --dry-run --json", async () => {
@@ -212,84 +230,8 @@ describe("ocx update", () => {
 
 		const json = JSON.parse(output)
 		expect(json.dryRun).toBe(true)
-		expect(json.wouldUpdate).toBeDefined()
-		expect(json.wouldUpdate.length).toBeGreaterThan(0)
-	})
-
-	// =========================================================================
-	// @version syntax tests
-	// =========================================================================
-
-	it("should pin to specific version with @version syntax", async () => {
-		testDir = await setupProject("update-version")
-
-		// Install component
-		await installComponent(testDir, "kdco/test-plugin")
-
-		// Record original file content
-		const filePath = join(testDir, ".opencode/plugin/test-plugin.ts")
-		const originalContent = await readFile(filePath, "utf-8")
-
-		// Change registry content
-		registry.setFileContent("test-plugin", "index.ts", "// Version pinned content")
-
-		// Run update with @version syntax
-		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin@1.0.0"], testDir)
-
-		expect(exitCode).toBe(0)
-		expect(output).toContain("Updated")
-
-		// Verify file was updated (not just that exit code is 0)
-		const updatedContent = await readFile(filePath, "utf-8")
-		expect(updatedContent).not.toBe(originalContent)
-		expect(updatedContent).toBe("// Version pinned content")
-
-		// Verify lock has the specified version
-		const lockPath = join(testDir, ".opencode/ocx.lock")
-		const lock = parseJsonc(await readFile(lockPath, "utf-8")) as Record<string, unknown>
-		const installed = lock.installed as Record<string, { version: string }>
-		expect(installed["kdco/test-plugin"].version).toBe("1.0.0")
-	})
-
-	it("should allow multiple components with different versions", async () => {
-		testDir = await setupProject("update-version-multi")
-
-		// Install multiple components
-		await installComponent(testDir, "kdco/test-plugin")
-		await installComponent(testDir, "kdco/test-skill")
-
-		// Change registry content for both
-		registry.setFileContent("test-plugin", "index.ts", "// Plugin v1.0.0")
-		registry.setFileContent("test-skill", "SKILL.md", "# Skill v1.0.0")
-
-		// Update multiple components with same version (both have 1.0.0 available)
-		const { exitCode, output } = await runCLI(
-			["update", "kdco/test-plugin@1.0.0", "kdco/test-skill@1.0.0"],
-			testDir,
-		)
-
-		expect(exitCode).toBe(0)
-		expect(output).toContain("Updated")
-
-		// Verify lock has the specified versions
-		const lockPath = join(testDir, ".opencode/ocx.lock")
-		const lock = parseJsonc(await readFile(lockPath, "utf-8")) as Record<string, unknown>
-		const installed = lock.installed as Record<string, { version: string }>
-		expect(installed["kdco/test-plugin"].version).toBe("1.0.0")
-		expect(installed["kdco/test-skill"].version).toBe("1.0.0")
-	})
-
-	it("should fail with empty version specifier", async () => {
-		testDir = await setupProject("update-version-empty")
-
-		// Install component
-		await installComponent(testDir, "kdco/test-plugin")
-
-		// Try to update with empty version
-		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin@"], testDir)
-
-		expect(exitCode).not.toBe(0)
-		expect(output).toContain("Invalid version specifier")
+		expect(json.wouldPerform).toBeDefined()
+		expect(json.wouldPerform.length).toBeGreaterThan(0)
 	})
 
 	// =========================================================================
@@ -363,8 +305,8 @@ describe("ocx update", () => {
 		// Don't install anything (no lock file will exist)
 		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
 
-		expect(exitCode).not.toBe(0)
-		expect(output).toContain("Nothing installed yet")
+		expect(exitCode).toBe(66) // NotFoundError exit code
+		expect(output).toContain("Component 'kdco/test-plugin' is not installed")
 	})
 
 	// =========================================================================
@@ -385,7 +327,7 @@ describe("ocx update", () => {
 		expect(output).toContain("kdco/test-plugin")
 	})
 
-	it("should fail when component name lacks registry prefix and is not found", async () => {
+	it("should fail when component name lacks registry alias and is not found", async () => {
 		testDir = await setupProject("update-no-prefix")
 
 		// Install component
@@ -395,7 +337,7 @@ describe("ocx update", () => {
 		const { exitCode, output } = await runCLI(["update", "nonexistent"], testDir)
 
 		expect(exitCode).not.toBe(0)
-		expect(output).toContain("must include a registry prefix")
+		expect(output).toContain("must include a registry alias")
 	})
 
 	// =========================================================================
@@ -420,6 +362,38 @@ describe("ocx update", () => {
 	// =========================================================================
 	// Already up to date tests
 	// =========================================================================
+
+	// =========================================================================
+	// Invalid version specifier tests (trailing @)
+	// =========================================================================
+
+	it("should reject trailing @ with CONFIG error (exit 78)", async () => {
+		testDir = await setupProject("update-trailing-at")
+
+		// Install a component so receipt exists
+		await installComponent(testDir, "kdco/test-plugin")
+
+		// Try to update with trailing @ (empty version specifier)
+		const { exitCode, output } = await runCLI(["update", "kdco/test-plugin@"], testDir)
+
+		expect(exitCode).toBe(78) // ConfigError exit code
+		expect(output).toContain("Invalid version specifier")
+		expect(output).toContain("kdco/test-plugin@")
+	})
+
+	it("should reject trailing @ for any component name", async () => {
+		testDir = await setupProject("update-trailing-at-any")
+
+		// Install a component so receipt exists
+		await installComponent(testDir, "kdco/test-plugin")
+
+		// Even a non-installed component with trailing @ should fail at parse, not receipt lookup
+		const { exitCode, output } = await runCLI(["update", "kdco/researcher@"], testDir)
+
+		expect(exitCode).toBe(78) // ConfigError, NOT 66 (NotFoundError)
+		expect(output).toContain("Invalid version specifier")
+		expect(output).toContain("kdco/researcher")
+	})
 
 	it("should skip components with matching hash (already up to date)", async () => {
 		testDir = await setupProject("update-up-to-date")
@@ -482,22 +456,228 @@ describe("ocx update", () => {
 		// Install component with dependencies
 		await installComponent(testDir, "kdco/test-agent")
 
-		// Verify all dependencies were installed
-		expect(existsSync(join(testDir, ".opencode/agent/test-agent.md"))).toBe(true)
-		expect(existsSync(join(testDir, ".opencode/skills/test-skill/SKILL.md"))).toBe(true)
-		expect(existsSync(join(testDir, ".opencode/plugin/test-plugin.ts"))).toBe(true)
+		// Verify all dependencies were installed (matches mock-registry paths)
+		expect(existsSync(join(testDir, ".opencode", "agents", "test-agent.md"))).toBe(true)
+		expect(existsSync(join(testDir, ".opencode", "skills", "test-skill", "SKILL.md"))).toBe(true)
+		expect(existsSync(join(testDir, ".opencode", "plugins", "test-plugin.ts"))).toBe(true)
 
 		// Change registry content for the main component only
 		registry.setFileContent("test-agent", "agent.md", "# Agent v2")
+		_clearFetcherCacheForTests() // Clear cache to ensure fresh fetch
 
 		// Run update on just the agent
-		const { exitCode } = await runCLI(["update", "kdco/test-agent"], testDir)
+		const { exitCode, output } = await runCLI(["update", "kdco/test-agent"], testDir)
 
 		expect(exitCode).toBe(0)
+		expect(output).toContain("Updated")
 
 		// Verify agent was updated
-		const agentContent = await readFile(join(testDir, ".opencode/agent/test-agent.md"), "utf-8")
+		const agentContent = await readFile(
+			join(testDir, ".opencode", "agents", "test-agent.md"),
+			"utf-8",
+		)
 		expect(agentContent).toBe("# Agent v2")
+	})
+
+	it("preflights target resolution before writing any files during update", async () => {
+		testDir = await setupProject("update-preflight-target-resolution")
+
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const pluginPath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const originalPluginContent = await readFile(pluginPath, "utf-8")
+
+		await writeFile(join(testDir, ".opencode", "command"), "blocker")
+
+		registry.setRouteError(
+			"/components/test-plugin.json",
+			200,
+			JSON.stringify({
+				name: "test-plugin",
+				"dist-tags": {
+					latest: "1.0.0",
+				},
+				versions: {
+					"1.0.0": {
+						name: "test-plugin",
+						type: "plugin",
+						description: "Preflight failure fixture",
+						files: [
+							{ path: "index.ts", target: "plugins/test-plugin.ts" },
+							{ path: "extra.md", target: "command/update-preflight-collision.md" },
+						],
+						dependencies: [],
+					},
+				},
+			}),
+		)
+		registry.setFileContent("test-plugin", "index.ts", "// should-not-be-written")
+		registry.setFileContent("test-plugin", "extra.md", "extra")
+		_clearFetcherCacheForTests()
+
+		try {
+			const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
+
+			expect(exitCode).not.toBe(0)
+			expect(output).toContain("not a directory")
+
+			const afterFailurePluginContent = await readFile(pluginPath, "utf-8")
+			expect(afterFailurePluginContent).toBe(originalPluginContent)
+		} finally {
+			registry.clearRouteOverrides()
+			registry.clearFileContent()
+			_clearFetcherCacheForTests()
+		}
+	})
+
+	it("rolls back already-written files when apply phase fails mid-update", async () => {
+		testDir = await setupProject("update-atomic-rollback")
+
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const pluginPath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const receiptPath = join(testDir, ".ocx", "receipt.jsonc")
+		const originalPluginContent = await readFile(pluginPath, "utf-8")
+		const originalReceiptContent = await readFile(receiptPath, "utf-8")
+
+		await mkdir(join(testDir, ".opencode", "plugins", "directory-target"), { recursive: true })
+
+		registry.setRouteError(
+			"/components/test-plugin.json",
+			200,
+			JSON.stringify({
+				name: "test-plugin",
+				"dist-tags": {
+					latest: "1.0.0",
+				},
+				versions: {
+					"1.0.0": {
+						name: "test-plugin",
+						type: "plugin",
+						description: "Apply phase failure fixture",
+						files: [
+							{ path: "index.ts", target: "plugins/test-plugin.ts" },
+							{ path: "second.md", target: "plugins/directory-target" },
+						],
+						dependencies: [],
+					},
+				},
+			}),
+		)
+		registry.setFileContent("test-plugin", "index.ts", "// should-be-rolled-back")
+		registry.setFileContent("test-plugin", "second.md", "second")
+		_clearFetcherCacheForTests()
+
+		try {
+			const { exitCode, output } = await runCLI(["update", "kdco/test-plugin"], testDir)
+
+			expect(exitCode).not.toBe(0)
+			expect(output).toContain("target path is a directory")
+
+			expect(await readFile(pluginPath, "utf-8")).toBe(originalPluginContent)
+			expect(await readFile(receiptPath, "utf-8")).toBe(originalReceiptContent)
+		} finally {
+			registry.clearRouteOverrides()
+			registry.clearFileContent()
+			_clearFetcherCacheForTests()
+		}
+	})
+
+	it("maps update failure phases to accurate spinner messages", () => {
+		expect(resolveUpdateFailureMessage("check")).toBe("Failed to check for updates")
+		expect(resolveUpdateFailureMessage("apply")).toBe("Failed to update components")
+	})
+
+	it("succeeds when backup cleanup fails after commit and leaves committed state", async () => {
+		testDir = await setupProject("update-post-commit-cleanup-failure")
+
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const pluginPath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const receiptPath = join(testDir, ".ocx", "receipt.jsonc")
+		const originalReceiptContent = await readFile(receiptPath, "utf-8")
+
+		registry.setFileContent("test-plugin", "index.ts", "// committed-despite-cleanup-failure")
+		_clearFetcherCacheForTests()
+
+		const provider = await LocalConfigProvider.requireInitialized(testDir)
+		const rmSpy = spyOn(fsPromises, "rm").mockImplementation(
+			async (
+				targetPath: Parameters<typeof fsPromises.rm>[0],
+				options?: Parameters<typeof fsPromises.rm>[1],
+			) => {
+				if (String(targetPath).includes(".ocx-update-backup-")) {
+					throw new Error("injected backup cleanup failure")
+				}
+
+				return fsRm(targetPath, options)
+			},
+		)
+
+		try {
+			await expect(
+				runUpdateCore(["kdco/test-plugin"], { quiet: true }, provider),
+			).resolves.toBeUndefined()
+		} finally {
+			rmSpy.mockRestore()
+		}
+
+		expect(await readFile(pluginPath, "utf-8")).toBe("// committed-despite-cleanup-failure")
+		expect(await readFile(receiptPath, "utf-8")).not.toBe(originalReceiptContent)
+	})
+
+	it("restores original file when swap rename fails after backup exists", async () => {
+		testDir = await setupProject("update-swap-rename-failure")
+
+		await installComponent(testDir, "kdco/test-plugin")
+
+		const pluginPath = join(testDir, ".opencode", "plugins", "test-plugin.ts")
+		const receiptPath = join(testDir, ".ocx", "receipt.jsonc")
+		const originalPluginContent = await readFile(pluginPath, "utf-8")
+		const originalReceiptContent = await readFile(receiptPath, "utf-8")
+
+		registry.setFileContent("test-plugin", "index.ts", "// rename-boundary-failure")
+		_clearFetcherCacheForTests()
+
+		let sawBackupRename = false
+		let sawInjectedSwapFailure = false
+		const provider = await LocalConfigProvider.requireInitialized(testDir)
+
+		const renameWithInjectedSwapFailure = async (
+			oldPath: string,
+			newPath: string,
+		): Promise<void> => {
+			if (newPath.includes(".ocx-update-backup-")) {
+				await fsRename(oldPath, newPath)
+				sawBackupRename = true
+				return
+			}
+
+			if (
+				oldPath.includes(".ocx-update-tmp-") &&
+				/[\\/]plugins[\\/]test-plugin\.ts$/.test(newPath)
+			) {
+				sawInjectedSwapFailure = true
+				throw new Error("injected swap rename failure")
+			}
+
+			await fsRename(oldPath, newPath)
+		}
+
+		await expect(
+			runUpdateCore(["kdco/test-plugin"], { quiet: true }, provider, {
+				rename: renameWithInjectedSwapFailure,
+			}),
+		).rejects.toThrow(/injected swap rename failure/)
+
+		expect(sawBackupRename).toBe(true)
+		expect(sawInjectedSwapFailure).toBe(true)
+		expect(await readFile(pluginPath, "utf-8")).toBe(originalPluginContent)
+		expect(await readFile(receiptPath, "utf-8")).toBe(originalReceiptContent)
+
+		const pluginDirEntries = await readdir(join(testDir, ".opencode", "plugins"))
+		expect(pluginDirEntries.some((entry) => entry.includes(".ocx-update-backup-"))).toBe(false)
+		expect(pluginDirEntries.some((entry) => entry.includes(".ocx-update-tmp-"))).toBe(false)
 	})
 
 	it("should fail if not initialized", async () => {

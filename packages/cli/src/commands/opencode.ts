@@ -9,12 +9,10 @@
 
 import type { Command } from "commander"
 import { ConfigResolver } from "../config/resolver"
-import { ProfileManager } from "../profile/manager"
 import { getProfileDir, getProfileOpencodeConfig } from "../profile/paths"
-import { ProfilesNotInitializedError } from "../utils/errors"
 import { getGitInfo } from "../utils/git-context"
 import { handleError, logger } from "../utils/index"
-import { resolveConfigPatterns } from "../utils/resolve-config"
+import { getGlobalConfigPath } from "../utils/paths"
 import {
 	formatTerminalName,
 	restoreTerminalTitle,
@@ -25,6 +23,32 @@ import {
 interface OpencodeOptions {
 	profile?: string
 	rename?: boolean
+}
+
+/**
+ * Deduplicates an array while preserving last occurrence.
+ * Last-wins behavior: if duplicates exist, keeps the LAST occurrence.
+ *
+ * Example: ["a", "b", "a", "c"] -> ["b", "a", "c"]
+ * (first "a" is removed, last "a" is kept)
+ *
+ * @internal - Exported for testing
+ */
+export function dedupeLastWins<T>(items: T[]): T[] {
+	const seen = new Set<T>()
+	const result: T[] = []
+
+	// Iterate backwards to find last occurrences
+	for (let i = items.length - 1; i >= 0; i--) {
+		// biome-ignore lint/style/noNonNullAssertion: index i is guaranteed valid within bounds
+		const item = items[i]!
+		if (!seen.has(item)) {
+			seen.add(item)
+			result.unshift(item) // Prepend to maintain order
+		}
+	}
+
+	return result
 }
 
 /**
@@ -46,19 +70,27 @@ export function resolveOpenCodeBinary(opts: { configBin?: string; envBin?: strin
  * Behavior:
  * - Preserves all keys from baseEnv
  * - Overwrites OCX_PROFILE, OPENCODE_* keys with new values
- * - OPENCODE_DISABLE_PROJECT_CONFIG always set to "true" when disableProjectConfig is true
+ * - OPENCODE_DISABLE_PROJECT_CONFIG: set to "true" ONLY when a profile is active
+ *   (profileName is provided). When no profile, project config is NOT disabled.
+ * - OPENCODE_CONFIG_DIR: when profile active → profile-specific dir;
+ *   when no profile → global config dir (XDG-aware)
+ * - configContent is a pre-serialized JSON string; upstream OpenCode handles
+ *   {env:...} / {file:...} token resolution in OPENCODE_CONFIG_CONTENT
  */
 export function buildOpenCodeEnv(opts: {
 	baseEnv: Record<string, string | undefined>
-	profileDir?: string
 	profileName?: string
 	configContent?: string
-	disableProjectConfig: boolean
 }): Record<string, string | undefined> {
+	// Profile presence gates both OPENCODE_DISABLE_PROJECT_CONFIG and OPENCODE_CONFIG_DIR
+	const hasProfile = Boolean(opts.profileName)
+
 	return {
 		...opts.baseEnv,
-		...(opts.disableProjectConfig && { OPENCODE_DISABLE_PROJECT_CONFIG: "true" }),
-		...(opts.profileDir && { OPENCODE_CONFIG_DIR: opts.profileDir }),
+		...(hasProfile && { OPENCODE_DISABLE_PROJECT_CONFIG: "true" }),
+		OPENCODE_CONFIG_DIR: hasProfile
+			? getProfileDir(opts.profileName as string)
+			: getGlobalConfigPath(),
 		...(opts.configContent && { OPENCODE_CONFIG_CONTENT: opts.configContent }),
 		...(opts.profileName && { OCX_PROFILE: opts.profileName }),
 	}
@@ -91,14 +123,6 @@ async function runOpencode(args: string[], options: OpencodeOptions): Promise<vo
 	const config = resolver.resolve()
 	const profile = resolver.getProfile()
 
-	// Guard: If profile is specified but profiles aren't initialized
-	if (options.profile) {
-		const manager = ProfileManager.create()
-		if (!(await manager.isInitialized())) {
-			throw new ProfilesNotInitializedError()
-		}
-	}
-
 	// Print feedback about which profile is being used
 	if (config.profileName) {
 		logger.info(`Using profile: ${config.profileName}`)
@@ -108,9 +132,6 @@ async function runOpencode(args: string[], options: OpencodeOptions): Promise<vo
 	// Precedence: CLI flag > config > default(true)
 	const ocxConfig = profile?.ocx
 	const shouldRename = options.rename !== false && ocxConfig?.renameWindow !== false
-
-	// Get profile directory if we have a profile
-	const profileDir = config.profileName ? getProfileDir(config.profileName) : undefined
 
 	// Check for profile's opencode.jsonc (optional)
 	if (config.profileName) {
@@ -125,11 +146,20 @@ async function runOpencode(args: string[], options: OpencodeOptions): Promise<vo
 	}
 
 	// Build the config to pass to OpenCode
+	// Merge discovered instructions with user-configured instructions
+	// Order: discovered/global/profile/registry/project first, then user config instructions last (highest priority)
+	const userInstructions = Array.isArray(config.opencode.instructions)
+		? config.opencode.instructions
+		: []
+	const allInstructions = [...config.instructions, ...userInstructions]
+	// Deduplicate while preserving last occurrence (last-wins)
+	const dedupedInstructions = dedupeLastWins(allInstructions)
+
 	const configToPass =
-		config.instructions.length > 0 || Object.keys(config.opencode).length > 0
+		dedupedInstructions.length > 0 || Object.keys(config.opencode).length > 0
 			? {
 					...config.opencode,
-					instructions: config.instructions.length > 0 ? config.instructions : undefined,
+					instructions: dedupedInstructions.length > 0 ? dedupedInstructions : undefined,
 				}
 			: undefined
 
@@ -184,21 +214,16 @@ async function runOpencode(args: string[], options: OpencodeOptions): Promise<vo
 		envBin: process.env.OPENCODE_BIN,
 	})
 
-	// Resolve config patterns ({env:VAR}, {file:path}) before passing to OpenCode
-	const configContent = configToPass
-		? await resolveConfigPatterns(JSON.stringify(configToPass), profileDir ?? projectDir)
-		: undefined
-
 	// Spawn OpenCode directly in the project directory with config via environment
+	const configContent = configToPass ? JSON.stringify(configToPass) : undefined
+
 	proc = Bun.spawn({
 		cmd: [bin, ...args],
 		cwd: projectDir,
 		env: buildOpenCodeEnv({
 			baseEnv: process.env as Record<string, string | undefined>,
-			profileDir,
 			profileName: config.profileName ?? undefined,
 			configContent,
-			disableProjectConfig: true,
 		}),
 		stdin: "inherit",
 		stdout: "inherit",

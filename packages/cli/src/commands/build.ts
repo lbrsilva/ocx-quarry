@@ -4,10 +4,11 @@
  * CLI wrapper around the buildRegistry library function.
  */
 
-import { join, relative } from "node:path"
+import { relative, resolve } from "node:path"
 import type { Command } from "commander"
 import kleur from "kleur"
-import { BuildRegistryError, buildRegistry } from "../lib/build-registry"
+import { BuildRegistryError, type BuildRegistryResult, buildRegistry } from "../lib/build-registry"
+import { outputDryRun } from "../utils/dry-run"
 import { createSpinner, handleError, logger, outputJson } from "../utils/index"
 
 interface BuildOptions {
@@ -15,6 +16,7 @@ interface BuildOptions {
 	out: string
 	json: boolean
 	quiet: boolean
+	dryRun?: boolean
 }
 
 export function registerBuildCommand(program: Command): void {
@@ -26,10 +28,11 @@ export function registerBuildCommand(program: Command): void {
 		.option("--cwd <path>", "Working directory", process.cwd())
 		.option("--json", "Output as JSON", false)
 		.option("-q, --quiet", "Suppress output", false)
+		.option("--dry-run", "Validate and show what would be built")
 		.action(async (path: string, options: BuildOptions) => {
 			try {
-				const sourcePath = join(options.cwd, path)
-				const outPath = join(options.cwd, options.out)
+				const sourcePath = resolve(options.cwd, path)
+				const outPath = resolve(options.cwd, options.out)
 
 				const spinner = createSpinner({
 					text: "Building registry...",
@@ -40,13 +43,24 @@ export function registerBuildCommand(program: Command): void {
 				const result = await buildRegistry({
 					source: sourcePath,
 					out: outPath,
+					dryRun: options.dryRun,
 				})
 
+				// Handle dry-run result
+				if ("dryRun" in result && result.dryRun) {
+					if (!options.json) spinner.stop()
+					outputDryRun(result, { json: options.json, quiet: options.quiet })
+					return
+				}
+
+				// Type narrowing: result is now BuildRegistryResult
+				const buildResult = result as BuildRegistryResult
+
 				if (!options.json) {
-					const msg = `Built ${result.componentsCount} components to ${relative(options.cwd, outPath)}`
+					const msg = `Built ${buildResult.componentsCount} components to ${relative(options.cwd, outPath)}`
 					spinner.succeed(msg)
 					if (process.env.NODE_ENV === "test" || !process.stdout.isTTY) {
-						logger.success(`Built ${result.componentsCount} components`)
+						logger.success(`Built ${buildResult.componentsCount} components`)
 					}
 				}
 
@@ -54,10 +68,8 @@ export function registerBuildCommand(program: Command): void {
 					outputJson({
 						success: true,
 						data: {
-							name: result.name,
-							version: result.version,
-							components: result.componentsCount,
-							output: result.outputPath,
+							components: buildResult.componentsCount,
+							output: buildResult.outputPath,
 						},
 					})
 				}

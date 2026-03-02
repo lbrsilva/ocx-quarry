@@ -30,9 +30,6 @@ export const sharedOptions = {
 	/** Target a specific profile's config */
 	profile: () => new Option("-p, --profile <name>", "Target a specific profile's config"),
 
-	/** Skip confirmation prompts */
-	force: () => new Option("-f, --force", "Skip confirmation prompts"),
-
 	/** Verbose output */
 	verbose: () => new Option("-v, --verbose", "Verbose output"),
 
@@ -63,20 +60,6 @@ export function addCommonOptions<T extends { addOption: (opt: Option) => T }>(cm
 }
 
 /**
- * Add force option to a command for skipping confirmation prompts.
- *
- * @example
- * ```typescript
- * const cmd = program.command("destructive")
- * addForceOption(cmd)
- *   .action(handler)
- * ```
- */
-export function addForceOption<T extends { addOption: (opt: Option) => T }>(cmd: T): T {
-	return cmd.addOption(sharedOptions.force())
-}
-
-/**
  * Add verbose option to a command.
  *
  * @example
@@ -88,21 +71,6 @@ export function addForceOption<T extends { addOption: (opt: Option) => T }>(cmd:
  */
 export function addVerboseOption<T extends { addOption: (opt: Option) => T }>(cmd: T): T {
 	return cmd.addOption(sharedOptions.verbose())
-}
-
-/**
- * Add output options (json, quiet) to a command.
- * Use this for commands that don't need --cwd (like profile commands).
- *
- * @example
- * ```typescript
- * const cmd = program.command("init")
- * addOutputOptions(cmd)
- *   .action(handler)
- * ```
- */
-export function addOutputOptions<T extends { addOption: (opt: Option) => T }>(cmd: T): T {
-	return cmd.addOption(sharedOptions.json()).addOption(sharedOptions.quiet())
 }
 
 /**

@@ -11,11 +11,19 @@
  * - Package-managed install detection
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { join } from "node:path"
+import { logger } from "../src/utils/logger.js"
 import { cleanupTempDir, createTempDir, runCLI, runCLIIsolated } from "./helpers"
+
+let selfUninstallImportCounter = 0
+
+async function importSelfUninstallCommandModule() {
+	const cacheBuster = selfUninstallImportCounter++
+	return import(`../src/commands/self/uninstall.js?test=${cacheBuster}`)
+}
 
 // =============================================================================
 // Test Setup Helpers
@@ -72,8 +80,8 @@ describe("ocx self uninstall --dry-run", () => {
 		})
 
 		expect(exitCode).toBe(0)
-		expect(stdout).toContain("Dry run")
-		expect(stdout).toContain("would be removed")
+		expect(stdout).toContain("DRY RUN")
+		expect(stdout).toContain("Would remove")
 
 		// Files should still exist
 		expect(existsSync(root)).toBe(true)
@@ -90,7 +98,7 @@ describe("ocx self uninstall --dry-run", () => {
 
 		expect(exitCode).toBe(0)
 		expect(stdout).toContain("profiles")
-		expect(stdout).toContain("[dir]")
+		expect(stdout).toContain("kind: directory")
 	})
 
 	it("lists ocx.jsonc file in output", async () => {
@@ -102,7 +110,7 @@ describe("ocx self uninstall --dry-run", () => {
 
 		expect(exitCode).toBe(0)
 		expect(stdout).toContain("ocx.jsonc")
-		expect(stdout).toContain("[file]")
+		expect(stdout).toContain("kind: file")
 	})
 
 	it("exits with code 0", async () => {
@@ -121,9 +129,9 @@ describe("ocx self uninstall --dry-run", () => {
 		const { exitCode, stdout } = await runCLIIsolated(["self", "uninstall", "--dry-run"], testDir)
 
 		expect(exitCode).toBe(0)
-		// Root is shown with "(if empty)" note
+		// Root is shown with "deleteIfEmpty: true" note
 		expect(stdout).toContain("opencode")
-		expect(stdout).toContain("(if empty)")
+		expect(stdout).toContain("deleteIfEmpty: true")
 	})
 })
 
@@ -681,5 +689,64 @@ describe("ocx self uninstall (idempotency)", () => {
 
 		// Should exit 0 (curl behavior), proving isolation works
 		expect(exitCode).toBe(0)
+	})
+})
+
+describe("ocx self uninstall --json win32 output hygiene", () => {
+	let testDir: string
+
+	afterEach(async () => {
+		mock.restore()
+		if (testDir) {
+			await cleanupTempDir(testDir)
+		}
+	})
+
+	it("does not emit human logger output on win32 JSON path", async () => {
+		testDir = await createTempDir("uninstall-json-win32")
+		createMockGlobalConfig(testDir)
+
+		const consoleLogSpy = spyOn(console, "log").mockImplementation(() => {})
+		const loggerInfoSpy = spyOn(logger, "info").mockImplementation(() => {})
+
+		const originalPlatform = process.platform
+		const originalXdg = process.env.XDG_CONFIG_HOME
+		const originalNpmUserAgent = process.env.npm_config_user_agent
+		Object.defineProperty(process, "platform", { value: "win32" })
+		process.env.XDG_CONFIG_HOME = testDir
+		process.env.npm_config_user_agent = ""
+
+		const exitSpy = spyOn(process, "exit").mockImplementation(((code?: number) => {
+			throw new Error(`EXIT:${code ?? 0}`)
+		}) as (...args: [number?]) => never)
+
+		try {
+			const { runUninstall } = await importSelfUninstallCommandModule()
+			await expect(runUninstall({ json: true })).rejects.toThrow("EXIT:0")
+		} finally {
+			exitSpy.mockRestore()
+			Object.defineProperty(process, "platform", { value: originalPlatform })
+			if (originalXdg === undefined) {
+				delete process.env.XDG_CONFIG_HOME
+			} else {
+				process.env.XDG_CONFIG_HOME = originalXdg
+			}
+			if (originalNpmUserAgent === undefined) {
+				delete process.env.npm_config_user_agent
+			} else {
+				process.env.npm_config_user_agent = originalNpmUserAgent
+			}
+		}
+
+		expect(loggerInfoSpy).not.toHaveBeenCalled()
+		expect(consoleLogSpy).toHaveBeenCalledTimes(1)
+
+		const jsonCalls = consoleLogSpy.mock.calls as Array<[unknown]>
+		const payloadRaw = jsonCalls[0]?.[0]
+		const payload =
+			typeof payloadRaw === "string"
+				? (JSON.parse(payloadRaw) as { success?: boolean })
+				: ((payloadRaw ?? {}) as { success?: boolean })
+		expect(payload.success).toBe(true)
 	})
 })

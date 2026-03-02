@@ -75,6 +75,7 @@ describe("init --registry", () => {
 			[
 				"init",
 				"--registry",
+				testDir,
 				"--local",
 				REGISTRY_FIXTURE,
 				"--namespace",
@@ -93,10 +94,12 @@ describe("init --registry", () => {
 		expect(existsSync(registryPath)).toBe(true)
 
 		const content = await readFile(registryPath, "utf-8")
+		const manifest = parseJsonc(content) as { $schema?: string }
 
 		// Positive assertions - new values present
 		expect(content).toContain('"namespace": "test-namespace"')
 		expect(content).toContain('"author": "Test Author"')
+		expect(manifest.$schema).toBe("https://ocx.kdco.dev/schemas/v2/registry.json")
 
 		// CRITICAL: Negative assertions - template placeholders GONE
 		// These are the original template values that should be replaced
@@ -108,7 +111,17 @@ describe("init --registry", () => {
 		testDir = await createTempDir("init-registry-output")
 
 		const { exitCode, output } = await runCLI(
-			["init", "--registry", "--local", REGISTRY_FIXTURE, "--namespace", "my-ns", "--author", "Me"],
+			[
+				"init",
+				"--registry",
+				testDir,
+				"--local",
+				REGISTRY_FIXTURE,
+				"--namespace",
+				"my-ns",
+				"--author",
+				"Me",
+			],
 			testDir,
 		)
 
@@ -125,6 +138,7 @@ describe("init --registry", () => {
 			[
 				"init",
 				"--registry",
+				testDir,
 				"--local",
 				REGISTRY_FIXTURE,
 				"--namespace",
@@ -185,7 +199,7 @@ describe("init --global", () => {
 			$schema?: string
 			registries?: Record<string, unknown>
 		}
-		expect(profileOcx.$schema).toBeDefined()
+		expect(profileOcx.$schema).toBe("https://ocx.kdco.dev/schemas/profile.json")
 		expect(profileOcx.registries).toEqual({})
 
 		// Check profile opencode.jsonc

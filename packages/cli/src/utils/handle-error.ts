@@ -14,6 +14,7 @@ import {
 	OCXError,
 	ProfileExistsError,
 	ProfileNotFoundError,
+	RegistryCompatibilityError,
 	RegistryExistsError,
 } from "./errors"
 import { logger } from "./logger"
@@ -107,10 +108,12 @@ function formatErrorAsJson(error: unknown): JsonErrorOutput {
 				code: error.code,
 				message: error.message,
 				details: {
+					conflictType: error.conflictType,
 					registryName: error.registryName,
 					existingUrl: error.existingUrl,
 					newUrl: error.newUrl,
 					...(error.targetLabel && { targetLabel: error.targetLabel }),
+					...(error.existingName && { existingName: error.existingName }),
 				},
 			},
 			exitCode: error.exitCode,
@@ -222,6 +225,30 @@ function formatErrorAsJson(error: unknown): JsonErrorOutput {
 				},
 			},
 			exitCode: EXIT_CODES.GENERAL,
+			meta: {
+				timestamp: new Date().toISOString(),
+			},
+		}
+	}
+
+	if (error instanceof RegistryCompatibilityError) {
+		const details: Record<string, unknown> = {
+			url: error.url,
+			issue: error.issue,
+			remediation: error.remediation,
+		}
+		if (error.schemaUrl !== undefined) details.schemaUrl = error.schemaUrl
+		if (error.supportedMajor !== undefined) details.supportedMajor = error.supportedMajor
+		if (error.detectedMajor !== undefined) details.detectedMajor = error.detectedMajor
+
+		return {
+			success: false,
+			error: {
+				code: error.code,
+				message: error.message,
+				details,
+			},
+			exitCode: error.exitCode,
 			meta: {
 				timestamp: new Date().toISOString(),
 			},

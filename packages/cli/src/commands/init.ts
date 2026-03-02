@@ -7,7 +7,7 @@ import { existsSync } from "node:fs"
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import type { Command } from "commander"
-import { OCX_SCHEMA_URL } from "../constants"
+import { OCX_SCHEMA_URL, REGISTRY_SCHEMA_LATEST_URL } from "../constants"
 import { atomicWrite } from "../profile/atomic"
 import { DEFAULT_OCX_CONFIG } from "../profile/manager"
 import {
@@ -22,6 +22,7 @@ import { findOcxConfig, ocxConfigSchema } from "../schemas/config"
 import { ensureOpencodeConfig } from "../updaters/update-opencode-config"
 import { ConflictError, NetworkError, ValidationError } from "../utils/errors"
 import { createSpinner, handleError, logger } from "../utils/index"
+import { addCommonOptions, addGlobalOption, addVerboseOption } from "../utils/shared-options"
 
 declare const __VERSION__: string | undefined
 
@@ -33,34 +34,31 @@ interface InitOptions {
 	quiet?: boolean
 	verbose?: boolean
 	json?: boolean
-	registry?: boolean
+	registry?: string
 	namespace?: string
 	author?: string
 	canary?: boolean
 	local?: string
-	force?: boolean // Only used for --registry mode
 	global?: boolean
 }
 
 export function registerInitCommand(program: Command): void {
-	program
-		.command("init [directory]")
-		.description("Initialize OCX configuration in your project")
-		.option("--cwd <path>", "Working directory", process.cwd())
-		.option("-q, --quiet", "Suppress output")
-		.option("-v, --verbose", "Verbose output")
-		.option("--json", "Output as JSON")
-		.option("--registry", "Scaffold a new OCX registry project")
+	const cmd = program.command("init").description("Initialize OCX configuration in your project")
+
+	addCommonOptions(cmd)
+	addVerboseOption(cmd)
+	addGlobalOption(cmd)
+
+	cmd
+		.option("--registry <path>", "Scaffold a new OCX registry project at path")
 		.option("--namespace <name>", "Registry namespace (e.g., my-org)")
 		.option("--author <name>", "Author name for the registry")
 		.option("--canary", "Use canary (main branch) instead of latest release")
 		.option("--local <path>", "Use local template directory instead of fetching")
-		.option("-f, --force", "Overwrite existing files (registry mode only)")
-		.option("-g, --global", "Initialize in global OpenCode config (~/.config/opencode)")
-		.action(async (directory: string | undefined, options: InitOptions) => {
+		.action(async (options: InitOptions) => {
 			try {
 				if (options.registry) {
-					await runInitRegistry(directory, options)
+					await runInitRegistry(options.registry, options)
 				} else if (options.global) {
 					await runInitGlobal(options)
 				} else {
@@ -230,7 +228,7 @@ async function runInitGlobal(options: InitOptions): Promise<void> {
 				logger.info("  1. Edit your profile config: ocx config edit -p default")
 				logger.info("  2. Add registries: ocx registry add <url> --name <name> --global")
 				logger.info("  3. Launch OpenCode: ocx opencode")
-				logger.info("  4. Create more profiles: ocx profile add <name>")
+				logger.info("  4. Create more profiles: ocx profile add <name> --global")
 			} else {
 				logger.info("Global profiles already initialized (all files exist)")
 			}
@@ -241,8 +239,8 @@ async function runInitGlobal(options: InitOptions): Promise<void> {
 	}
 }
 
-async function runInitRegistry(directory: string | undefined, options: InitOptions): Promise<void> {
-	const cwd = directory ?? options.cwd ?? process.cwd()
+async function runInitRegistry(registryPath: string, options: InitOptions): Promise<void> {
+	const cwd = registryPath
 	const namespace = options.namespace ?? "my-registry"
 	const author = options.author ?? "Your Name"
 
@@ -257,8 +255,10 @@ async function runInitRegistry(directory: string | undefined, options: InitOptio
 	const existingFiles = await readdir(cwd).catch(() => [])
 	const hasVisibleFiles = existingFiles.some((f) => !f.startsWith("."))
 
-	if (hasVisibleFiles && !options.force) {
-		throw new ConflictError("Directory is not empty. Use --force to overwrite existing files.")
+	if (hasVisibleFiles) {
+		throw new ConflictError(
+			"Directory is not empty. Remove existing files or choose a different directory.",
+		)
 	}
 
 	const spin = options.quiet ? null : createSpinner({ text: "Scaffolding registry..." })
@@ -414,6 +414,17 @@ async function replacePlaceholders(
 		content = content.replace(/my-registry/g, values.namespace)
 		content = content.replace(/My Registry/g, toTitleCase(values.namespace))
 		content = content.replace(/Your Name/g, values.author)
+
+		if (file === "registry.jsonc") {
+			if (/"\$schema"\s*:/.test(content)) {
+				content = content.replace(
+					/("\$schema"\s*:\s*")[^"]*(")/,
+					`$1${REGISTRY_SCHEMA_LATEST_URL}$2`,
+				)
+			} else {
+				content = content.replace(/{/, `{\n\t"$schema": "${REGISTRY_SCHEMA_LATEST_URL}",`)
+			}
+		}
 
 		await writeFile(filePath, content)
 	}

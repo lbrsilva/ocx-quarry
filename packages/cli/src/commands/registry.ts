@@ -12,13 +12,14 @@ import { ProfileManager } from "../profile/manager"
 import { getProfileOcxConfig } from "../profile/paths"
 import type { RegistryConfig } from "../schemas/config"
 import { findOcxConfig, readOcxConfig, writeOcxConfig } from "../schemas/config"
+import { type DryRunResult, outputDryRun } from "../utils/dry-run"
 import {
-	OcxConfigError,
+	ConfigError,
 	ProfileNotFoundError,
 	RegistryExistsError,
 	ValidationError,
 } from "../utils/errors"
-import { handleError, logger, outputJson } from "../utils/index"
+import { handleError, logger, normalizeRegistryUrl, outputJson } from "../utils/index"
 import { getGlobalConfigPath } from "../utils/paths"
 import {
 	addCommonOptions,
@@ -36,9 +37,8 @@ export interface RegistryOptions {
 }
 
 export interface RegistryAddOptions extends RegistryOptions {
-	name?: string
-	version?: string
-	force?: boolean
+	name: string // Always present — enforced by Commander .requiredOption()
+	dryRun?: boolean
 }
 
 // =============================================================================
@@ -58,8 +58,11 @@ export async function runRegistryAddCore(
 		getRegistries: () => Record<string, RegistryConfig>
 		isLocked?: () => boolean
 		setRegistry: (name: string, config: RegistryConfig) => Promise<void>
+		targetLabel?: string // For dry-run summary
 	},
-): Promise<{ name: string; url: string; updated: boolean }> {
+): Promise<
+	{ name: string; url: string; updated: boolean; alreadyConfigured: boolean } | DryRunResult
+> {
 	// Guard: Check registries aren't locked
 	if (callbacks.isLocked?.()) {
 		throw new Error("Registries are locked. Cannot add.")
@@ -70,32 +73,133 @@ export async function runRegistryAddCore(
 	if (!trimmedUrl) {
 		throw new ValidationError("Registry URL is required")
 	}
-	let derivedName: string
 	try {
 		const parsed = new URL(trimmedUrl)
 		if (!["http:", "https:"].includes(parsed.protocol)) {
 			throw new ValidationError(`Invalid registry URL: ${trimmedUrl} (must use http or https)`)
 		}
-		derivedName = options.name || parsed.hostname.replace(/\./g, "-")
 	} catch (error) {
 		if (error instanceof ValidationError) throw error
 		throw new ValidationError(`Invalid registry URL: ${trimmedUrl}`)
 	}
 
-	const name = derivedName
-	const registries = callbacks.getRegistries()
-	const existingRegistry = registries[name]
-	if (existingRegistry && !options.force) {
-		throw new RegistryExistsError(name, existingRegistry.url, trimmedUrl)
-	}
-	const isUpdate = name in registries
+	const normalizedUrl = normalizeRegistryUrl(trimmedUrl)
 
+	const name = options.name
+	const registries = callbacks.getRegistries()
+	const existingByName = registries[name]
+
+	// URL uniqueness check: find any existing registry with the same normalized URL
+	const existingByUrl = findRegistryByUrl(registries, normalizedUrl)
+
+	// Fetch registry index to validate the URL serves a valid registry
+	const { fetchRegistryIndex } = await import("../registry/fetcher")
+	await fetchRegistryIndex(normalizedUrl)
+
+	// -------------------------------------------------------------------------
+	// Conflict resolution matrix (alias-first model)
+	// Rule 1: New name + new URL => add
+	// Rule 2: Same name + same URL => idempotent no-op
+	// Rule 3: Same name + different URL => fail (name conflict)
+	// Rule 4: Different name + same URL => fail (URL conflict)
+	// -------------------------------------------------------------------------
+
+	const nameExists = existingByName !== undefined
+	const urlExists = existingByUrl !== null
+	const sameUrl = nameExists && normalizeRegistryUrl(existingByName.url) === normalizedUrl
+	const urlOwnedByDifferentName = urlExists && existingByUrl.name !== name
+
+	// Dry-run mode: report what would happen
+	if (options.dryRun) {
+		const warnings: string[] = []
+
+		if (nameExists && !sameUrl) {
+			warnings.push(
+				`Registry '${name}' already exists with a different URL (${existingByName.url}). ` +
+					`Run 'ocx registry remove ${name}' first, then re-add.`,
+			)
+		} else if (urlOwnedByDifferentName) {
+			warnings.push(
+				`URL '${normalizedUrl}' is already registered under name '${existingByUrl.name}'. ` +
+					`Run 'ocx registry remove ${existingByUrl.name}' first, then re-add.`,
+			)
+		}
+
+		const isConflict = (nameExists && !sameUrl) || urlOwnedByDifferentName
+		const isIdempotent = nameExists && sameUrl
+		const targetLabel = callbacks.targetLabel || "config"
+
+		const dryRunResult: DryRunResult = {
+			dryRun: true,
+			command: "registry add",
+			wouldPerform: isIdempotent
+				? []
+				: [
+						{
+							action: "add",
+							target: `registry:${name}`,
+							details: {
+								url: normalizedUrl,
+							},
+						},
+					],
+			validation: {
+				passed: !isConflict,
+				warnings: warnings.length > 0 ? warnings : undefined,
+			},
+			summary: isConflict
+				? `Would fail: conflict detected for registry '${name}'`
+				: isIdempotent
+					? `Registry '${name}' already configured with same URL (no-op)`
+					: `Would add registry '${name}' to ${targetLabel}`,
+		}
+
+		return dryRunResult
+	}
+
+	// Rule 3: Same name + different URL => fail
+	if (nameExists && !sameUrl) {
+		throw new RegistryExistsError(name, existingByName.url, normalizedUrl, callbacks.targetLabel)
+	}
+
+	// Rule 4: Different name + same URL => fail
+	if (urlOwnedByDifferentName) {
+		throw new RegistryExistsError(
+			name,
+			normalizedUrl,
+			normalizedUrl,
+			callbacks.targetLabel,
+			existingByUrl.name,
+		)
+	}
+
+	// Rule 2: Same name + same URL => idempotent no-op
+	if (nameExists && sameUrl) {
+		return { name, url: normalizedUrl, updated: false, alreadyConfigured: true }
+	}
+
+	// Rule 1: New name + new URL => add
 	await callbacks.setRegistry(name, {
-		url: trimmedUrl,
-		version: options.version,
+		url: normalizedUrl,
 	})
 
-	return { name, url: trimmedUrl, updated: isUpdate }
+	return { name, url: normalizedUrl, updated: false, alreadyConfigured: false }
+}
+
+/**
+ * Find an existing registry entry by normalized URL.
+ * Returns the entry name and config if found, null otherwise.
+ */
+function findRegistryByUrl(
+	registries: Record<string, RegistryConfig>,
+	normalizedUrl: string,
+): { name: string; config: RegistryConfig } | null {
+	for (const [name, config] of Object.entries(registries)) {
+		if (normalizeRegistryUrl(config.url) === normalizedUrl) {
+			return { name, config }
+		}
+	}
+	return null
 }
 
 /**
@@ -132,14 +236,13 @@ export async function runRegistryRemoveCore(
 export function runRegistryListCore(callbacks: {
 	getRegistries: () => Record<string, RegistryConfig>
 	isLocked?: () => boolean
-}): { registries: Array<{ name: string; url: string; version: string }>; locked: boolean } {
+}): { registries: Array<{ name: string; url: string }>; locked: boolean } {
 	const registries = callbacks.getRegistries()
 	const locked = callbacks.isLocked?.() ?? false
 
 	const list = Object.entries(registries).map(([name, cfg]) => ({
 		name,
 		url: cfg.url,
-		version: cfg.version || "latest",
 	}))
 
 	return { registries: list, locked }
@@ -189,7 +292,7 @@ async function resolveRegistryTarget(
 
 		const configPath = getProfileOcxConfig(options.profile)
 		if (!existsSync(configPath)) {
-			throw new OcxConfigError(
+			throw new ConfigError(
 				`Profile '${options.profile}' has no ocx.jsonc. Run 'ocx profile config ${options.profile}' to create it.`,
 			)
 		}
@@ -230,14 +333,16 @@ async function resolveRegistryTarget(
 export function registerRegistryCommand(program: Command): void {
 	const registry = program.command("registry").description("Manage registries")
 
-	// registry add <url> [--name <name>]
+	// registry add <url> --name <name>
 	const addCmd = registry
 		.command("add")
 		.description("Add a registry")
 		.argument("<url>", "Registry URL")
-		.option("--name <name>", "Registry alias (defaults to hostname)")
-		.option("--version <version>", "Pin to specific version")
-		.option("-f, --force", "Overwrite existing registry")
+		.requiredOption(
+			"--name <name>",
+			"Registry alias (required, used as lookup key for alias/component refs)",
+		)
+		.option("--dry-run", "Validate registry without adding to config")
 
 	addGlobalOption(addCmd)
 	addProfileOption(addCmd)
@@ -270,29 +375,39 @@ export function registerRegistryCommand(program: Command): void {
 					config.registries[name] = regConfig
 					await writeOcxConfig(configDir, config, configPath)
 				},
+				targetLabel: target.targetLabel,
 			})
 
+			// Handle dry-run result
+			if ("dryRun" in result && result.dryRun) {
+				outputDryRun(result, { json: options.json, quiet: options.quiet })
+				return
+			}
+
+			// Type narrowing: result is now the add-result shape
+			const actualResult = result as {
+				name: string
+				url: string
+				updated: boolean
+				alreadyConfigured: boolean
+			}
+
 			if (options.json) {
-				outputJson({ success: true, data: result })
+				outputJson({ success: true, data: actualResult })
 			} else if (!options.quiet) {
-				if (result.updated) {
+				if (actualResult.alreadyConfigured) {
+					logger.info(`Registry already configured (no changes): ${actualResult.name}`)
+				} else if (actualResult.updated) {
 					logger.success(
-						`Updated registry in ${target.targetLabel}: ${result.name} -> ${result.url}`,
+						`Updated registry in ${target.targetLabel}: ${actualResult.name} -> ${actualResult.url}`,
 					)
 				} else {
-					logger.success(`Added registry to ${target.targetLabel}: ${result.name} -> ${result.url}`)
+					logger.success(
+						`Added registry to ${target.targetLabel}: ${actualResult.name} -> ${actualResult.url}`,
+					)
 				}
 			}
 		} catch (error) {
-			if (error instanceof RegistryExistsError && !error.targetLabel) {
-				const enrichedError = new RegistryExistsError(
-					error.registryName,
-					error.existingUrl,
-					error.newUrl,
-					target?.targetLabel ?? "config",
-				)
-				handleError(enrichedError, { json: options.json })
-			}
 			handleError(error, { json: options.json })
 		}
 	})
@@ -390,7 +505,7 @@ export function registerRegistryCommand(program: Command): void {
 						`Configured registries${scopeLabel}${result.locked ? kleur.yellow(" (locked)") : ""}:`,
 					)
 					for (const reg of result.registries) {
-						console.log(`  ${kleur.cyan(reg.name)}: ${reg.url} ${kleur.dim(`(${reg.version})`)}`)
+						console.log(`  ${kleur.cyan(reg.name)}: ${reg.url}`)
 					}
 				}
 			}

@@ -1,17 +1,19 @@
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises"
-import { parse } from "jsonc-parser"
+import { type ParseError, parse as parseJsonc, printParseErrorCode } from "jsonc-parser"
 import type { ProfileOcxConfig } from "../schemas/ocx"
 import { profileOcxConfigSchema } from "../schemas/ocx"
 import {
+	ConfigError,
 	ConflictError,
 	InvalidProfileNameError,
-	OcxConfigError,
+	LocalProfileUnsupportedError,
 	ProfileExistsError,
 	ProfileNotFoundError,
 	ProfilesNotInitializedError,
 } from "../utils/errors"
 import { atomicWrite } from "./atomic"
 import {
+	getLocalProfileDir,
 	getProfileAgents,
 	getProfileDir,
 	getProfileOcxConfig,
@@ -26,7 +28,7 @@ import { profileNameSchema } from "./schema"
  * Note: AGENTS.md is NOT excluded by default - it's commented out in the template.
  */
 export const DEFAULT_OCX_CONFIG: ProfileOcxConfig = {
-	$schema: "https://ocx.kdco.dev/schemas/ocx.json",
+	$schema: "https://ocx.kdco.dev/schemas/profile.json",
 	registries: {},
 	renameWindow: true,
 	exclude: [
@@ -44,7 +46,7 @@ export const DEFAULT_OCX_CONFIG: ProfileOcxConfig = {
  * Includes commented-out AGENTS.md line so users can easily enable exclusion.
  */
 export const DEFAULT_OCX_CONFIG_TEMPLATE = `{
-  "$schema": "https://ocx.kdco.dev/schemas/ocx.json",
+  "$schema": "https://ocx.kdco.dev/schemas/profile.json",
   "registries": {},
   "renameWindow": true,
   "exclude": [
@@ -59,19 +61,96 @@ export const DEFAULT_OCX_CONFIG_TEMPLATE = `{
 }
 `
 
+function formatJsoncParseError(parseErrors: ParseError[]): string {
+	if (parseErrors.length === 0) {
+		return "Unknown parse error"
+	}
+
+	const firstError = parseErrors[0]
+	if (!firstError) {
+		return "Unknown parse error"
+	}
+
+	return `${printParseErrorCode(firstError.error)} at offset ${firstError.offset}`
+}
+
+function parseJsoncOrThrow(content: string, filePath: string): unknown {
+	const parseErrors: ParseError[] = []
+	const parsed = parseJsonc(content, parseErrors, { allowTrailingComma: true })
+
+	if (parseErrors.length > 0) {
+		const errorDetail = formatJsoncParseError(parseErrors)
+		throw new ConfigError(`Invalid JSONC in ${filePath}: ${errorDetail}`)
+	}
+
+	return parsed
+}
+
+function parseProfileOcxConfigOrThrow(
+	rawConfig: unknown,
+	filePath: string,
+	profileName: string,
+): ProfileOcxConfig {
+	const validationResult = profileOcxConfigSchema.safeParse(rawConfig)
+	if (!validationResult.success) {
+		const firstIssue = validationResult.error.issues[0]
+		const issuePath = firstIssue?.path.length ? firstIssue.path.join(".") : "root"
+		const issueMessage = firstIssue?.message ?? "Invalid profile OCX configuration"
+		throw new ConfigError(
+			`Invalid profile "${profileName}" ocx.jsonc at ${filePath}: ${issuePath} ${issueMessage}`,
+		)
+	}
+
+	return validationResult.data
+}
+
+function parseProfileOpencodeConfigOrThrow(
+	rawConfig: unknown,
+	filePath: string,
+	profileName: string,
+): Record<string, unknown> {
+	if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+		throw new ConfigError(
+			`Invalid profile "${profileName}" opencode.jsonc at ${filePath}: root must be an object`,
+		)
+	}
+
+	return rawConfig as Record<string, unknown>
+}
+
+function requireNonEmptyProfileName(profileName: string, sourceDescription: string): string {
+	if (profileName.trim().length === 0) {
+		throw new ConfigError(
+			`Invalid profile from ${sourceDescription}: value cannot be empty or whitespace`,
+		)
+	}
+
+	return profileName
+}
+
 /**
- * Manages OCX profiles.
+ * Manages OCX profiles (global-only).
+ *
+ * All profiles are stored in the global config directory (~/.config/opencode/profiles/).
+ * Local profiles are unsupported; any local profile directory presence triggers a hard error
+ * via getLayered().
+ *
  * Uses static factory pattern for consistent construction.
  */
 export class ProfileManager {
-	private constructor(private readonly profilesDir: string) {}
+	private constructor(private readonly cwd: string = process.cwd()) {}
+
+	/** Returns the profiles directory, reading fresh from environment each access. */
+	private get profilesDir(): string {
+		return getProfilesDir()
+	}
 
 	/**
 	 * Create a ProfileManager instance.
 	 * Does not require profiles to be initialized.
 	 */
-	static create(): ProfileManager {
-		return new ProfileManager(getProfilesDir())
+	static create(cwd?: string): ProfileManager {
+		return new ProfileManager(cwd ?? process.cwd())
 	}
 
 	/**
@@ -111,12 +190,13 @@ export class ProfileManager {
 	}
 
 	/**
-	 * List all profile names.
-	 * @returns Array of profile names
+	 * List all global profile names.
+	 * @returns Array of profile names, sorted alphabetically
 	 */
 	async list(): Promise<string[]> {
 		await this.ensureInitialized()
-		const entries = await readdir(this.profilesDir, { withFileTypes: true })
+
+		const entries = await readdir(this.profilesDir, { withFileTypes: true, encoding: "utf8" })
 		return entries
 			.filter((e) => e.isDirectory() && !e.name.startsWith("."))
 			.map((e) => e.name)
@@ -124,7 +204,7 @@ export class ProfileManager {
 	}
 
 	/**
-	 * Check if a profile exists.
+	 * Check if a global profile exists.
 	 * @param name - Profile name
 	 */
 	async exists(name: string): Promise<boolean> {
@@ -138,7 +218,7 @@ export class ProfileManager {
 	}
 
 	/**
-	 * Load a profile by name.
+	 * Load a global profile by name.
 	 * @param name - Profile name
 	 * @returns Loaded and validated profile
 	 */
@@ -152,12 +232,12 @@ export class ProfileManager {
 		const ocxFile = Bun.file(ocxPath)
 
 		if (!(await ocxFile.exists())) {
-			throw new OcxConfigError(`Profile "${name}" is missing ocx.jsonc. Expected at: ${ocxPath}`)
+			throw new ConfigError(`Profile "${name}" is missing ocx.jsonc. Expected at: ${ocxPath}`)
 		}
 
 		const ocxContent = await ocxFile.text()
-		const ocxRaw = parse(ocxContent)
-		const ocx = profileOcxConfigSchema.parse(ocxRaw)
+		const ocxRaw = parseJsoncOrThrow(ocxContent, ocxPath)
+		const ocx = parseProfileOcxConfigOrThrow(ocxRaw, ocxPath, name)
 
 		// Load opencode.jsonc (optional)
 		const opencodePath = getProfileOpencodeConfig(name)
@@ -165,7 +245,8 @@ export class ProfileManager {
 		let opencode: Record<string, unknown> | undefined
 		if (await opencodeFile.exists()) {
 			const opencodeContent = await opencodeFile.text()
-			opencode = parse(opencodeContent) as Record<string, unknown>
+			const opencodeRaw = parseJsoncOrThrow(opencodeContent, opencodePath)
+			opencode = parseProfileOpencodeConfigOrThrow(opencodeRaw, opencodePath, name)
 		}
 
 		// Check for AGENTS.md
@@ -182,7 +263,38 @@ export class ProfileManager {
 	}
 
 	/**
-	 * Create a new profile.
+	 * Load a global-only profile. Hard errors if a local profile directory exists.
+	 *
+	 * Local profiles are unsupported. If a local profile directory is detected
+	 * for the active profile, a LocalProfileUnsupportedError is thrown immediately
+	 * (Law 4: Fail Fast, Fail Loud).
+	 *
+	 * @param name - Profile name
+	 * @param cwd - Current working directory (for local profile detection)
+	 * @returns Global profile
+	 * @throws ProfileNotFoundError if global profile doesn't exist
+	 * @throws LocalProfileUnsupportedError if local profile directory exists
+	 */
+	async getLayered(name: string, cwd: string): Promise<Profile> {
+		// Guard: Reject local profile directory presence (Law 1: Early Exit)
+		const localDir = getLocalProfileDir(name, cwd)
+		let localExists = false
+		try {
+			const stats = await stat(localDir)
+			localExists = stats.isDirectory()
+		} catch {
+			localExists = false
+		}
+		if (localExists) {
+			throw new LocalProfileUnsupportedError(name, localDir)
+		}
+
+		// Load global profile (the only supported source)
+		return this.get(name)
+	}
+
+	/**
+	 * Create a new global profile.
 	 * @param name - Profile name (validated)
 	 */
 	async add(name: string): Promise<void> {
@@ -229,7 +341,7 @@ export class ProfileManager {
 	}
 
 	/**
-	 * Remove a profile.
+	 * Remove a global profile.
 	 * @param name - Profile name
 	 */
 	async remove(name: string): Promise<void> {
@@ -238,7 +350,6 @@ export class ProfileManager {
 		}
 
 		const profiles = await this.list()
-
 		if (profiles.length <= 1) {
 			throw new Error("Cannot delete the last profile. At least one profile must exist.")
 		}
@@ -248,7 +359,7 @@ export class ProfileManager {
 	}
 
 	/**
-	 * Move (rename) a profile atomically.
+	 * Move (rename) a global profile atomically.
 	 * @param oldName - Current profile name
 	 * @param newName - New profile name
 	 * @returns Object indicating if active profile warning should be shown
@@ -288,7 +399,7 @@ export class ProfileManager {
 		// 6. Check target doesn't exist
 		if (await this.exists(newName)) {
 			throw new ConflictError(
-				`Cannot move: profile "${newName}" already exists. Remove it first with 'ocx p rm ${newName}'.`,
+				`Cannot move: profile "${newName}" already exists. Remove it first with 'ocx profile rm ${newName} --global'.`,
 			)
 		}
 
@@ -306,7 +417,7 @@ export class ProfileManager {
 				const code = (error as NodeJS.ErrnoException).code
 				if (code === "EEXIST" || code === "ENOTEMPTY") {
 					throw new ConflictError(
-						`Cannot move: profile "${newName}" already exists. Remove it first with 'ocx p rm ${newName}'.`,
+						`Cannot move: profile "${newName}" already exists. Remove it first with 'ocx profile rm ${newName} --global'.`,
 					)
 				}
 				if (code === "ENOENT") {
@@ -329,20 +440,22 @@ export class ProfileManager {
 	 */
 	async resolveProfile(override?: string): Promise<string> {
 		// Priority 1: Explicit override from -p/--profile flag
-		if (override) {
-			if (!(await this.exists(override))) {
-				throw new ProfileNotFoundError(override)
+		if (override !== undefined) {
+			const profileName = requireNonEmptyProfileName(override, "CLI option --profile")
+			if (!(await this.exists(profileName))) {
+				throw new ProfileNotFoundError(profileName)
 			}
-			return override
+			return profileName
 		}
 
 		// Priority 2: OCX_PROFILE environment variable
 		const envProfile = process.env.OCX_PROFILE
-		if (envProfile) {
-			if (!(await this.exists(envProfile))) {
-				throw new ProfileNotFoundError(envProfile)
+		if (envProfile !== undefined) {
+			const profileName = requireNonEmptyProfileName(envProfile, "environment variable OCX_PROFILE")
+			if (!(await this.exists(profileName))) {
+				throw new ProfileNotFoundError(profileName)
 			}
-			return envProfile
+			return profileName
 		}
 
 		// Priority 3: Fall back to "default" profile

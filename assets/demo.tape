@@ -1,6 +1,12 @@
 # OCX Demo GIF
-# Generate with: vhs assets/demo.tape
+# Generate via repository workflow script:
+#   ./scripts/record-vhs-demos.sh
 # Requires: brew install vhs
+#
+# Note: The workflow script sets OCX_DEMO_FILTER_NOISE=1 to suppress
+# known wrangler asset-server 404 noise that appears during recording
+# but doesn't affect functionality. This filtering is demo-only and
+# doesn't modify product runtime behavior.
 
 Output assets/demo.gif
 
@@ -10,32 +16,22 @@ Set Width 800
 Set Height 500
 Set Padding 20
 
-# Initialize
+# Initialize local config (required before adding components)
 Type "ocx init"
 Sleep 500ms
 Enter
 Sleep 2s
 
-Enter
-
 # npm plugin (no registry needed)
-Type "ocx add npm:@franlol/opencode-md-table-formatter"
+Type "ocx add npm:oh-my-opencode"
 Sleep 500ms
 Enter
 Sleep 3s
 
 Enter
 
-# Add registry
-Type "ocx registry add https://registry.kdco.dev --name kdco"
-Sleep 500ms
-Enter
-Sleep 2s
-
-Enter
-
-# Registry bundle
-Type "ocx add kdco/workspace"
+# Add component directly from registry URL
+Type "ocx add kdco/workspace --from https://registry.kdco.dev"
 Sleep 500ms
 Enter
 Sleep 3s

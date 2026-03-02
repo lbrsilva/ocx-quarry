@@ -7,6 +7,13 @@
 
 import { isAbsolute, normalize } from "node:path"
 import { z } from "zod"
+import {
+	OCX_DOMAIN,
+	REGISTRY_SCHEMA_LATEST_MAJOR,
+	REGISTRY_SCHEMA_LATEST_URL,
+	REGISTRY_SCHEMA_UNVERSIONED_URL,
+} from "../constants"
+import type { RegistryCompatIssue } from "../utils/errors"
 import { ValidationError } from "../utils/errors"
 import { PathValidationError, validatePath } from "../utils/path-security"
 
@@ -68,41 +75,54 @@ export const openCodeNameSchema = z
 	})
 
 /**
- * Namespace schema - valid identifier for registry namespace
- * Same rules as openCodeNameSchema
+ * Alias schema — validates a user-chosen registry alias token.
+ * An alias is the left-hand side of an `alias/component` qualified reference
+ * (e.g. "kdco" in "kdco/researcher"). Same naming rules as openCodeNameSchema.
  */
-export const namespaceSchema = openCodeNameSchema
+export const aliasSchema = openCodeNameSchema
+
+/** @deprecated Use `aliasSchema` instead. Kept for backward compatibility. */
+export const namespaceSchema = aliasSchema
 
 /**
- * Qualified component reference: namespace/component
+ * Qualified component reference: alias/component
  * Used in CLI commands and lockfile keys
  */
 export const qualifiedComponentSchema = z
 	.string()
 	.regex(/^[a-z0-9]+(-[a-z0-9]+)*\/[a-z0-9]+(-[a-z0-9]+)*$/, {
 		message:
-			'Must be in format "namespace/component" (e.g., "kdco/researcher"). Both parts must be lowercase alphanumeric with hyphens.',
+			'Must be in format "alias/component" (e.g., "kdco/researcher"). Both parts must be lowercase alphanumeric with hyphens.',
 	})
 
 /**
- * Parse a qualified component reference into namespace and component.
- * Throws Error if format is invalid (Law 4: Fail Fast, Fail Loud).
+ * Parse a qualified component reference into its alias and component tokens.
+ *
+ * The returned `namespace` field is the user-chosen registry **alias** token
+ * from the `alias/component` syntax — it is NOT a registry index authority.
+ * The alias is resolved to a concrete registry URL at install time via ocx.jsonc.
+ *
+ * @throws Error if format is invalid (Law 4: Fail Fast, Fail Loud).
  */
 export function parseQualifiedComponent(ref: string): { namespace: string; component: string } {
 	if (!ref.includes("/")) {
-		throw new Error(`Invalid component reference: "${ref}". Use format: namespace/component`)
+		throw new Error(`Invalid component reference: "${ref}". Use format: alias/component`)
 	}
-	const [namespace, component] = ref.split("/")
-	if (!namespace || !component) {
+	const parts = ref.split("/")
+	if (parts.length > 2) {
 		throw new Error(
-			`Invalid component reference: "${ref}". Both namespace and component are required.`,
+			`Invalid component reference: "${ref}". Too many "/" separators. Use format: alias/component`,
 		)
+	}
+	const [namespace, component] = parts
+	if (!namespace || !component) {
+		throw new Error(`Invalid component reference: "${ref}". Both alias and component are required.`)
 	}
 	return { namespace, component }
 }
 
 /**
- * Create a qualified component reference from namespace and component
+ * Create a qualified component reference from alias and component name.
  */
 export function createQualifiedComponent(namespace: string, component: string): string {
 	return `${namespace}/${component}`
@@ -110,12 +130,12 @@ export function createQualifiedComponent(namespace: string, component: string): 
 
 /**
  * Dependency reference schema (Cargo-style):
- * - Bare string: "utils" -> same namespace (implicit)
- * - Qualified: "acme/utils" -> cross-namespace (explicit)
+ * - Bare string: "utils" -> same registry alias (implicit)
+ * - Qualified: "acme/utils" -> cross-registry (explicit)
  */
 export const dependencyRefSchema = z.string().refine(
 	(dep) => {
-		// Either a bare component name or a qualified namespace/component
+		// Either a bare component name or a qualified alias/component
 		const barePattern = /^[a-z0-9]+(-[a-z0-9]+)*$/
 		const qualifiedPattern = /^[a-z0-9]+(-[a-z0-9]+)*\/[a-z0-9]+(-[a-z0-9]+)*$/
 		return barePattern.test(dep) || qualifiedPattern.test(dep)
@@ -131,38 +151,63 @@ export const dependencyRefSchema = z.string().refine(
 // =============================================================================
 
 export const componentTypeSchema = z.enum([
-	"ocx:agent",
-	"ocx:skill",
-	"ocx:plugin",
-	"ocx:command",
-	"ocx:tool",
-	"ocx:bundle",
-	"ocx:profile",
+	"agent",
+	"skill",
+	"plugin",
+	"command",
+	"tool",
+	"bundle",
+	"profile",
 ])
 
 export type ComponentType = z.infer<typeof componentTypeSchema>
 
-/** Reserved targets for profiles (installer-owned files) */
-const PROFILE_RESERVED_TARGETS = new Set(["ocx.lock", ".opencode"])
+/** Reserved targets (installer-owned files) */
+const RESERVED_TARGETS = new Set([".ocx", "ocx.lock"])
 
 /**
- * Target path must be inside .opencode/ with valid subdirectory
+ * Paths that registry components cannot target.
+ * These are either OCX-managed files or dangerous paths.
+ */
+const BLOCKED_PATHS = [
+	// OCX-managed files
+	".ocx/", // Receipt, state (covers receipt.jsonc)
+	"ocx.jsonc", // OCX config
+	"package.json", // We generate this in .opencode/
+
+	// Dangerous paths
+	".git/", // Git internals
+	".env", // Secrets
+	"node_modules/", // Dependencies
+] as const
+
+/**
+ * V2: Target paths are root-relative (no .opencode/ prefix).
+ * Blocks protected paths that could compromise security or OCX functionality.
+ * Validates path safety using schema-level checks.
  */
 export const targetPathSchema = z
 	.string()
-	.refine((path) => path.startsWith(".opencode/"), {
-		message: 'Target path must start with ".opencode/"',
-	})
+	.min(1, "Target path cannot be empty")
 	.refine(
 		(path) => {
-			const parts = path.split("/")
-			const dir = parts[1]
-			if (!dir) return false
-			return ["agent", "skills", "plugin", "command", "tool", "philosophy"].includes(dir)
+			// No absolute paths
+			if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) return false
+			// No null bytes
+			if (path.includes("\0")) return false
+			return true
 		},
 		{
-			message:
-				'Target must be in a valid directory: ".opencode/{agent|skills|plugin|command|tool|philosophy}/..."',
+			message: "Target path must be relative and safe (no absolute paths or null bytes)",
+		},
+	)
+	.refine(
+		(path) => {
+			// Check if path is blocked
+			return !BLOCKED_PATHS.some((blocked) => path === blocked || path.startsWith(blocked))
+		},
+		{
+			message: "Target path is protected and cannot be overwritten by registry components",
 		},
 	)
 
@@ -241,10 +286,8 @@ export type McpServerRef = z.infer<typeof mcpServerRefSchema>
 // =============================================================================
 
 /**
- * Full file configuration object (profile-aware).
+ * Full file configuration object.
  * Target validation is deferred to normalizeFile() where component type is known.
- * For profiles: flat paths (ocx.jsonc, opencode.jsonc, AGENTS.md) or .opencode/... for embedded deps
- * For other types: must be .opencode/...
  */
 export const componentFileObjectSchema = z.object({
 	/** Source path in registry */
@@ -257,7 +300,7 @@ export type ComponentFileObject = z.infer<typeof componentFileObjectSchema>
 
 /**
  * Cargo-style file schema:
- * - String: Path shorthand, target auto-inferred (e.g., "plugin/foo.ts" -> ".opencode/plugin/foo.ts")
+ * - String: Path shorthand, target auto-inferred (e.g., "plugins/foo.ts" -> "plugins/foo.ts")
  * - Object: Full configuration with explicit target
  */
 export const componentFileSchema = z.union([
@@ -560,7 +603,7 @@ export type OpencodeConfig = z.infer<typeof opencodeConfigSchema>
 // =============================================================================
 
 export const componentManifestSchema = z.object({
-	/** Component name (clean, no namespace prefix) */
+	/** Component name (clean, no alias prefix) */
 	name: openCodeNameSchema,
 
 	/** Component type */
@@ -571,15 +614,16 @@ export const componentManifestSchema = z.object({
 
 	/**
 	 * Files to install (Cargo-style)
-	 * - String: "plugin/foo.ts" -> auto-infers target as ".opencode/plugin/foo.ts"
+	 * - String: "plugins/foo.ts" -> auto-infers target as "plugins/foo.ts"
 	 * - Object: { path: "...", target: "..." } for explicit control
+	 * - Optional: bundles (deps-only) may have no files
 	 */
-	files: z.array(componentFileSchema),
+	files: z.array(componentFileSchema).default([]),
 
 	/**
 	 * Dependencies on other components (Cargo-style)
-	 * - Bare string: "utils" -> same namespace (implicit)
-	 * - Qualified: "acme/utils" -> cross-namespace (explicit)
+	 * - Bare string: "utils" -> same registry alias (implicit)
+	 * - Qualified: "acme/utils" -> cross-registry (explicit)
 	 */
 	dependencies: z.array(dependencyRefSchema).default([]),
 
@@ -623,67 +667,70 @@ export function validateSafePath(filePath: string): void {
 }
 
 /**
- * Infer target path from source path
- * e.g., "plugin/foo.ts" -> ".opencode/plugin/foo.ts"
+ * V2: Infer target path from source path (root-relative, no prefix).
+ * The path is used as-is since targets are now root-relative.
+ * e.g., "plugins/foo.ts" -> "plugins/foo.ts"
  */
 export function inferTargetPath(sourcePath: string): string {
-	return `.opencode/${sourcePath}`
+	return sourcePath
 }
 
 /**
- * Validate a file target path based on component type.
- * - Profile types: allow flat paths (ocx.jsonc, etc.) OR .opencode/... for embedded deps
- * - Other types: require .opencode/... paths
+ * V2: Validate a file target path.
+ * Checks for reserved paths, blocked paths, and uses runtime containment validation.
+ * Component type is inferred from target path (behavior-based, not explicit).
  * @param target - The target path to validate
- * @param componentType - The component type for context-aware validation
- * @throws ValidationError if target is invalid for the component type
+ * @param componentType - Optional type hint for additional validation context
+ * @throws ValidationError if target is invalid
  */
 export function validateFileTarget(target: string, componentType?: ComponentType): void {
-	const isProfile = componentType === "ocx:profile"
+	// Check reserved targets
+	if (RESERVED_TARGETS.has(target)) {
+		throw new ValidationError(`Target "${target}" is reserved for installer use`)
+	}
 
-	if (isProfile) {
-		// Check reserved names
-		if (PROFILE_RESERVED_TARGETS.has(target)) {
-			throw new ValidationError(`Target "${target}" is reserved for installer use`)
+	// Validate path safety using battle-tested validation
+	try {
+		validatePath("/dummy/base", target) // Just validates the path structure
+	} catch (error) {
+		if (error instanceof PathValidationError) {
+			throw new ValidationError(`Invalid target "${target}": ${error.message}`)
 		}
+		throw error
+	}
 
-		// Validate path safety using battle-tested validation
-		try {
-			validatePath("/dummy/base", target) // Just validates the path structure
-		} catch (error) {
-			if (error instanceof PathValidationError) {
-				throw new ValidationError(`Invalid profile target "${target}": ${error.message}`)
-			}
-			throw error
-		}
+	// Check blocked paths (except for profiles, which install to their own directory)
+	const isProfile = componentType === "profile"
+	if (!isProfile) {
+		// Normalize the target path to evaluate the cleaned/resolved segments
+		// This prevents bypass via paths like "foo/../.git/config"
+		const normalized = normalize(target)
 
-		return // No further restrictions for profiles - trust the user
-	} else {
-		// Non-profile types require .opencode/... paths
-		const parseResult = targetPathSchema.safeParse(target)
-		if (!parseResult.success) {
+		// After normalization, check if path lands in blocked prefixes
+		const isBlocked = BLOCKED_PATHS.some(
+			(blocked) => normalized === blocked || normalized.startsWith(blocked),
+		)
+		if (isBlocked) {
 			throw new ValidationError(
-				`Invalid target: "${target}". ${parseResult.error.errors[0]?.message}`,
+				`Target path '${target}' is protected and cannot be overwritten by registry components`,
 			)
 		}
 	}
 }
 
 /**
- * Normalize a file entry from string shorthand to full object.
- * Handles profile type differently - uses flat paths without .opencode/ prefix.
+ * V2: Normalize a file entry from string shorthand to full object.
+ * All targets are root-relative (no .opencode/ prefix logic).
  * @param file - The file entry to normalize
- * @param componentType - Component type to determine path behavior and validation
+ * @param componentType - Optional component type for validation context
  */
 export function normalizeFile(
 	file: ComponentFile,
 	componentType?: ComponentType,
 ): ComponentFileObject {
-	const isProfile = componentType === "ocx:profile"
-
 	if (typeof file === "string") {
 		validateSafePath(file)
-		const target = isProfile ? file : inferTargetPath(file)
+		const target = inferTargetPath(file)
 		validateFileTarget(target, componentType)
 		return {
 			path: file,
@@ -760,25 +807,132 @@ export function normalizeComponentManifest(
 // REGISTRY SCHEMA
 // =============================================================================
 
+const REGISTRY_SCHEMA_VERSIONED_URL_REGEX = new RegExp(
+	`^https://${OCX_DOMAIN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/schemas/v([1-9]\\d*)/registry\\.json$`,
+)
+
+export interface RegistrySchemaUrlIssue {
+	issue: Exclude<RegistryCompatIssue, "invalid-format">
+	remediation: string
+	schemaUrl?: string
+	supportedMajor: number
+	detectedMajor?: number
+}
+
+/**
+ * Classify registry schema URL compatibility.
+ * Single source of truth for local manifests and remote index payloads.
+ */
+export function classifyRegistrySchemaIssue(document: unknown): RegistrySchemaUrlIssue | null {
+	if (document === null || document === undefined || typeof document !== "object") {
+		return null
+	}
+
+	const documentRecord = document as Record<string, unknown>
+	const hasSchemaField = Object.hasOwn(documentRecord, "$schema")
+	if (!hasSchemaField) {
+		return {
+			issue: "legacy-schema-v1",
+			remediation:
+				`This registry uses legacy schema v1 (missing $schema). ` +
+				`Set "$schema" to "${REGISTRY_SCHEMA_LATEST_URL}".`,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	const schemaUrl = documentRecord.$schema
+
+	if (typeof schemaUrl !== "string") {
+		return {
+			issue: "invalid-schema-url",
+			remediation: `Registry $schema must be a canonical URL like "${REGISTRY_SCHEMA_LATEST_URL}".`,
+			schemaUrl: String(schemaUrl),
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	if (!schemaUrl) {
+		return {
+			issue: "invalid-schema-url",
+			remediation: `Registry $schema must be a canonical URL like "${REGISTRY_SCHEMA_LATEST_URL}".`,
+			schemaUrl,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	if (schemaUrl === REGISTRY_SCHEMA_UNVERSIONED_URL) {
+		return {
+			issue: "legacy-schema-v1",
+			remediation:
+				`Schema URL "${REGISTRY_SCHEMA_UNVERSIONED_URL}" is legacy v1. ` +
+				`Use "${REGISTRY_SCHEMA_LATEST_URL}" instead.`,
+			schemaUrl,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	const versionMatch = schemaUrl.match(REGISTRY_SCHEMA_VERSIONED_URL_REGEX)
+	if (!versionMatch) {
+		return {
+			issue: "invalid-schema-url",
+			remediation: `Registry $schema must be a canonical URL like "${REGISTRY_SCHEMA_LATEST_URL}".`,
+			schemaUrl,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	const majorToken = versionMatch[1]
+	if (!majorToken) {
+		return {
+			issue: "invalid-schema-url",
+			remediation: `Registry $schema must be a canonical URL like "${REGISTRY_SCHEMA_LATEST_URL}".`,
+			schemaUrl,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+		}
+	}
+
+	const major = Number.parseInt(majorToken, 10)
+	if (major !== REGISTRY_SCHEMA_LATEST_MAJOR) {
+		return {
+			issue: "unsupported-schema-version",
+			remediation:
+				`Schema major v${major} is unsupported. ` +
+				`Use "${REGISTRY_SCHEMA_LATEST_URL}" (v${REGISTRY_SCHEMA_LATEST_MAJOR}).`,
+			schemaUrl,
+			supportedMajor: REGISTRY_SCHEMA_LATEST_MAJOR,
+			detectedMajor: major,
+		}
+	}
+
+	return null
+}
+
 /**
  * Semver regex for version validation
  */
 const semverRegex = /^\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$/
 
+/**
+ * Registry manifest schema.
+ *
+ * `name`, `version`, and `author` are **required** metadata.
+ * This is intentional — every published registry must be identifiable and
+ * versioned so that OCX can resolve, cache, and diff registries reliably.
+ * Omitting `name` or `version` is a validation error at parse time
+ * (Law 4: Fail Fast, Fail Loud).
+ */
 export const registrySchema = z
 	.object({
-		/** Registry name */
+		/** JSON Schema URL for IDE support */
+		$schema: z.string().optional(),
+
+		/** Registry display name (required — identifies the registry to users and tooling) */
 		name: z.string().min(1, "Registry name cannot be empty"),
 
-		/** Registry namespace - used in qualified component references (e.g., kdco/researcher) */
-		namespace: namespaceSchema,
+		/** Registry version, semver (required — enables deterministic resolution and caching) */
+		version: z.string().regex(semverRegex, { message: "Version must be valid semver" }),
 
-		/** Registry version (semver) */
-		version: z.string().regex(semverRegex, {
-			message: "Version must be valid semver (e.g., '1.0.0', '2.1.0-beta.1')",
-		}),
-
-		/** Registry author */
+		/** Registry author (required) */
 		author: z.string().min(1, "Author cannot be empty"),
 
 		/** Minimum OpenCode version required (semver, e.g., "1.0.0") */
@@ -804,11 +958,11 @@ export const registrySchema = z
 		(data) => {
 			// All dependencies must either:
 			// 1. Be a bare name that exists in this registry
-			// 2. Be a qualified cross-namespace reference (validated at install time)
+			// 2. Be a qualified cross-registry reference (validated at install time)
 			const componentNames = new Set(data.components.map((c) => c.name))
 			for (const component of data.components) {
 				for (const dep of component.dependencies) {
-					// Only validate bare (same-namespace) dependencies
+					// Only validate bare (same-registry) dependencies
 					if (!dep.includes("/") && !componentNames.has(dep)) {
 						return false
 					}
@@ -818,7 +972,7 @@ export const registrySchema = z
 		},
 		{
 			message:
-				"Bare dependencies must reference components that exist in the registry. Use qualified references (e.g., 'other-registry/component') for cross-namespace dependencies.",
+				"Bare dependencies must reference components that exist in the registry. Use qualified references (e.g., 'other-registry/component') for cross-registry dependencies.",
 		},
 	)
 
@@ -848,10 +1002,10 @@ export type Packument = z.infer<typeof packumentSchema>
 // =============================================================================
 
 export const registryIndexSchema = z.object({
-	/** Registry metadata */
-	name: z.string(),
-	namespace: namespaceSchema,
-	version: z.string(),
+	/** JSON Schema URL for IDE support */
+	$schema: z.string().optional(),
+
+	/** Registry author */
 	author: z.string(),
 
 	/** Minimum OpenCode version required */

@@ -1,20 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import type { NpmPackageVersion } from "../../src/utils/npm-registry"
 
+const CHECK_MODULE_PATH = require.resolve("../../src/self-update/check.js")
+const NPM_REGISTRY_MODULE_PATH = require.resolve("../../src/utils/npm-registry.js")
+
+function clearCheckModuleCache(): void {
+	delete require.cache[CHECK_MODULE_PATH]
+	delete require.cache[NPM_REGISTRY_MODULE_PATH]
+}
+
 // =============================================================================
 // Test Utilities
 // =============================================================================
 
 /**
  * Dynamic import with cache busting to get fresh module state.
- * Required because checkForUpdate reads __VERSION__ at module load time.
+ *
+ * Uses a query-string cache buster with Bun.randomUUIDv7() to bypass any
+ * leaked mock.module registration from other test files (e.g. hook.test.ts).
+ * Bun treats each unique specifier as a separate module, so each unique
+ * query string always resolves to the REAL source, never a stale mock.
+ *
+ * The require.cache cleanup ensures the CommonJS side is also fresh.
  */
 async function importCheckModule() {
-	// Clear the module from cache to allow re-import with different mocks
-	const modulePath = require.resolve("../../src/self-update/check.js")
-	delete require.cache[modulePath]
-
-	return import("../../src/self-update/check.js")
+	clearCheckModuleCache()
+	const uniqueId = Bun.randomUUIDv7()
+	return import(`../../src/self-update/check.js?t=${uniqueId}`)
 }
 
 // =============================================================================
@@ -36,6 +48,7 @@ describe("checkForUpdate", () => {
 		// Restore original fetch
 		fetchSpy.mockRestore()
 		global.fetch = originalFetch
+		clearCheckModuleCache()
 	})
 
 	describe("in development mode (__VERSION__ undefined)", () => {
@@ -65,6 +78,7 @@ describe("checkForUpdate", () => {
 
 		afterEach(() => {
 			mock.restore()
+			clearCheckModuleCache()
 		})
 
 		it("returns { ok: false } on network error", async () => {
@@ -116,66 +130,76 @@ describe("checkForUpdate with mocked registry", () => {
 	afterEach(() => {
 		// Restore all mocks
 		mock.restore()
+		clearCheckModuleCache()
 	})
 
-	it("detects when update is available (latest > current)", async () => {
+	it("skips update check in dev mode (0.0.0-dev)", async () => {
 		// This test documents expected behavior when __VERSION__ is set
 		// In production build, if current=1.0.0 and latest=2.0.0, should return updateAvailable=true
+		// But in dev/test environment, the early exit returns dev-version before any network call
 
-		// Mock returns a newer version
+		// Mock returns a newer version (would trigger update in production)
 		mockFetchPackageVersion.mockResolvedValue({
 			name: "ocx",
 			version: "99.0.0",
 		} as NpmPackageVersion)
 
-		// In dev environment, checkForUpdate returns dev-version reason due to dev version
-		// This test documents the expected behavior for production
 		const { checkForUpdate } = await importCheckModule()
 		const result = await checkForUpdate()
 
-		// Dev mode returns { ok: false, reason: 'dev-version' } - this is expected
-		// The test documents that in production with version mismatch, it would work
+		// Dev mode returns { ok: false, reason: 'dev-version' } - expected behavior
 		expect(result.ok).toBe(false)
 		if (!result.ok) expect(result.reason).toBe("dev-version")
 	})
 
-	it("returns { ok: false } when versions match in dev mode", async () => {
-		// Mock returns same version as current (in production, this would be the current version)
+	it("skips update check in dev mode even when versions would match", async () => {
+		// Mock returns same version as dev version
 		mockFetchPackageVersion.mockResolvedValue({
 			name: "ocx",
-			version: "0.0.0-dev", // Same as dev version
+			version: "0.0.0-dev",
 		} as NpmPackageVersion)
 
 		const { checkForUpdate } = await importCheckModule()
 		const result = await checkForUpdate()
 
-		// Dev mode returns dev-version before checking
+		// Dev mode returns dev-version before checking registry
 		expect(result.ok).toBe(false)
 		if (!result.ok) expect(result.reason).toBe("dev-version")
 	})
 
-	it("handles registry timeout gracefully", async () => {
-		// Mock a hanging fetch
+	it("handles registry timeout gracefully with injected version", async () => {
+		// Mock a hanging fetch that respects abort signal
 		mockFetchPackageVersion.mockImplementation(
-			() => new Promise(() => {}), // Never resolves
+			(_name: string, _version: string | undefined, signal?: AbortSignal) =>
+				new Promise((_resolve, reject) => {
+					signal?.addEventListener("abort", () => reject(signal.reason))
+				}),
 		)
 
 		const { checkForUpdate } = await importCheckModule()
-		const result = await checkForUpdate()
+		// Inject non-dev version to bypass dev-mode short-circuit
+		const result = await checkForUpdate({ version: "1.0.0" }, 100)
 
-		// Should return { ok: false } (either from dev version or timeout)
+		// Should return { ok: false, reason: 'timeout' }
 		expect(result.ok).toBe(false)
+		if (!result.ok) {
+			expect(result.reason).toBe("timeout")
+		}
 	})
 
-	it("handles registry error gracefully", async () => {
+	it("handles registry error gracefully with injected version", async () => {
 		// Mock a failing fetch
 		mockFetchPackageVersion.mockRejectedValue(new Error("Registry unavailable"))
 
 		const { checkForUpdate } = await importCheckModule()
-		const result = await checkForUpdate()
+		// Inject non-dev version to bypass dev-mode short-circuit
+		const result = await checkForUpdate({ version: "1.0.0" })
 
-		// Should return { ok: false } (silent failure)
+		// Should return { ok: false, reason: 'invalid-response' }
 		expect(result.ok).toBe(false)
+		if (!result.ok) {
+			expect(result.reason).toBe("invalid-response")
+		}
 	})
 })
 
@@ -200,6 +224,7 @@ describe("checkForUpdate with injected VersionProvider", () => {
 
 	afterEach(() => {
 		mock.restore()
+		clearCheckModuleCache()
 	})
 
 	it("uses injected version provider", async () => {

@@ -3,6 +3,8 @@
  *
  * Parent command for managing global profiles.
  * Profiles allow multiple named configurations for different contexts.
+ * Global profiles: ~/.config/opencode/profiles/ (user-wide)
+ * Local profiles are unsupported and produce a hard error.
  *
  * Alias: `ocx p` (shorthand for `ocx profile`)
  */
@@ -18,7 +20,7 @@ import { registerProfileShowCommand } from "./show"
  * Register the profile command and all subcommands.
  */
 export function registerProfileCommand(program: Command): void {
-	const profile = program.command("profile").alias("p").description("Manage global profiles")
+	const profile = program.command("profile").alias("p").description("Manage profiles (global only)")
 
 	registerProfileListCommand(profile)
 	registerProfileAddCommand(profile)

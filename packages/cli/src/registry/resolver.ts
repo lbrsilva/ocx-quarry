@@ -13,21 +13,18 @@ import {
 	type OpencodeConfig,
 	parseQualifiedComponent,
 } from "../schemas/registry"
-import {
-	ConfigError,
-	NetworkError,
-	NotFoundError,
-	OCXError,
-	ValidationError,
-} from "../utils/errors"
+import { NetworkError, NotFoundError, OCXError, ValidationError } from "../utils/errors"
 import { fetchComponent } from "./fetcher"
 import { mergeOpencodeConfig } from "./merge"
 
 /**
- * Parse a component reference into namespace and component name.
+ * Parse a component reference into registry alias and component name.
  * - "kdco/researcher" -> { namespace: "kdco", component: "researcher" }
  * - "researcher" (with defaultNamespace) -> { namespace: defaultNamespace, component: "researcher" }
  * - "researcher" (without defaultNamespace) -> throws error
+ *
+ * Note: The `namespace` field is the user-chosen registry alias, NOT a
+ * registry-declared namespace.  Component refs use `<alias>/<component>`.
  */
 export function parseComponentRef(
 	ref: string,
@@ -38,21 +35,21 @@ export function parseComponentRef(
 		return parseQualifiedComponent(ref)
 	}
 
-	// Bare name - use default namespace if provided
+	// Bare name - use default alias if provided
 	if (defaultNamespace) {
 		return { namespace: defaultNamespace, component: ref }
 	}
 
-	throw new ValidationError(`Component '${ref}' must include a namespace (e.g., 'kdco/${ref}')`)
+	throw new ValidationError(
+		`Component '${ref}' must include a registry alias (e.g., 'kdco/${ref}')`,
+	)
 }
 
 export interface ResolvedComponent extends NormalizedComponentManifest {
-	/** The namespace this component belongs to */
-	namespace: string
-	/** The registry name from ocx.jsonc */
+	/** The registry name from ocx.jsonc (configured alias) */
 	registryName: string
 	baseUrl: string
-	/** Qualified name (namespace/component) */
+	/** Qualified name (registryName/component) */
 	qualifiedName: string
 }
 
@@ -103,11 +100,11 @@ export async function resolveDependencies(
 
 		visiting.add(qualifiedName)
 
-		// Look up the registry for this namespace
+		// Look up the registry for this alias
 		const regConfig = registries[componentNamespace]
 		if (!regConfig) {
-			throw new ConfigError(
-				`Registry '${componentNamespace}' not configured. Add it to ocx.jsonc registries.`,
+			throw new NotFoundError(
+				`Registry alias '${componentNamespace}' not found. Add it with 'ocx registry add <url> --name ${componentNamespace}'.`,
 			)
 		}
 
@@ -139,7 +136,7 @@ export async function resolveDependencies(
 
 		// Resolve dependencies first (depth-first)
 		for (const dep of component.dependencies) {
-			// Parse dependency: bare name = same namespace, "foo/bar" = cross-namespace
+			// Parse dependency: bare name = same registry alias, "foo/bar" = cross-registry
 			const depRef = parseComponentRef(dep, componentNamespace)
 			await resolve(depRef.namespace, depRef.component, [...path, qualifiedName])
 		}
@@ -150,7 +147,6 @@ export async function resolveDependencies(
 		// Add to resolved (dependencies are already added)
 		resolved.set(qualifiedName, {
 			...normalizedComponent,
-			namespace: componentNamespace,
 			registryName: componentNamespace,
 			baseUrl: regConfig.url,
 			qualifiedName,
@@ -181,7 +177,7 @@ export async function resolveDependencies(
 
 	// Resolve all requested components
 	for (const name of componentNames) {
-		// Parse qualified component name (must include namespace)
+		// Parse qualified component name (must include registry alias)
 		const ref = parseComponentRef(name)
 		await resolve(ref.namespace, ref.component)
 	}
