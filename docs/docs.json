@@ -87,6 +87,15 @@
 					{
 						"group": "Security",
 						"pages": ["security/policy", "security/verification"]
+					},
+					{
+						"group": "Maintainers",
+						"hidden": true,
+						"pages": [
+							"maintainers/migration-v1-4-0",
+							"maintainers/kdco-registry",
+							"maintainers/ocx-kit"
+						]
 					}
 				]
 			}
