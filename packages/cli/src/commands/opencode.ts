@@ -23,6 +23,7 @@ import {
 interface OpencodeOptions {
 	profile?: string
 	rename?: boolean
+	quarry?: boolean
 }
 
 /**
@@ -103,6 +104,7 @@ export function registerOpencodeCommand(program: Command): void {
 		.description("Launch OpenCode with resolved configuration")
 		.option("-p, --profile <name>", "Use specific profile")
 		.option("--no-rename", "Disable terminal/tmux window renaming")
+		.option("--quarry", "Use quarry opencode instead of opencode (for Bedrock/Opus)")
 		.allowUnknownOption()
 		.allowExcessArguments(true)
 		.action(async (options: OpencodeOptions, command: Command) => {
@@ -209,16 +211,24 @@ async function runOpencode(args: string[], options: OpencodeOptions): Promise<vo
 	}
 
 	// Determine OpenCode binary
-	const bin = resolveOpenCodeBinary({
-		configBin: ocxConfig?.bin,
-		envBin: process.env.OPENCODE_BIN,
-	})
+	// If --quarry flag is set, use quarry opencode instead of opencode
+	let cmd: string[]
+	if (options.quarry) {
+		// Use quarry opencode -- to pass through args
+		cmd = ["quarry", "opencode", "--", ...args]
+	} else {
+		const bin = resolveOpenCodeBinary({
+			configBin: ocxConfig?.bin,
+			envBin: process.env.OPENCODE_BIN,
+		})
+		cmd = [bin, ...args]
+	}
 
 	// Spawn OpenCode directly in the project directory with config via environment
 	const configContent = configToPass ? JSON.stringify(configToPass) : undefined
 
 	proc = Bun.spawn({
-		cmd: [bin, ...args],
+		cmd: cmd,
 		cwd: projectDir,
 		env: buildOpenCodeEnv({
 			baseEnv: process.env as Record<string, string | undefined>,
