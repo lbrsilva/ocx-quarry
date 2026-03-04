@@ -7,6 +7,7 @@ import { handleError } from "../utils/handle-error"
 
 interface OpencodeOptions {
 	profile?: string
+	quarry?: boolean
 }
 type OpenCodeShutdownSignal = "SIGINT" | "SIGTERM"
 const OPENCODE_SIGNAL_GRACE_MS = 2500
@@ -173,6 +174,7 @@ export function registerOpencodeCommand(program: Command): void {
 		.alias("opencode")
 		.description("Launch OpenCode V2 using a named profile")
 		.option("-p, --profile <name>", "Use a named profile")
+		.option("--quarry", "Use quarry opencode instead of opencode (for Bedrock/Opus)")
 		.helpOption(false)
 		.passThroughOptions()
 		.allowUnknownOption()
@@ -195,20 +197,26 @@ export async function runOpencode(args: string[], options: OpencodeOptions): Pro
 		profileName: name,
 		projectConfig: profile.ocx.projectConfig,
 	})
-	const configuredBin = resolveOpenCodeBinary({
-		configBin: profile.ocx.bin,
-		envBin: process.env.OPENCODE_BIN,
-	})
-	const binary = resolveStableOpenCodeLauncherPath({ configuredBin, cwd: process.cwd() })
 	const nativeArgs = buildOpenCodeArgs(args)
-	await requireOpenCodeV2(binary, env)
+	let command: string[]
+	if (options.quarry) {
+		command = ["quarry", "opencode", "--", ...nativeArgs]
+	} else {
+		const configuredBin = resolveOpenCodeBinary({
+			configBin: profile.ocx.bin,
+			envBin: process.env.OPENCODE_BIN,
+		})
+		const binary = resolveStableOpenCodeLauncherPath({ configuredBin, cwd: process.cwd() })
+		await requireOpenCodeV2(binary, env)
+		command = [binary, ...nativeArgs]
+	}
 	const supervisor = createOpenCodeShutdownSupervisor()
 	const interrupt = () => supervisor.handleSigint()
 	const terminate = () => supervisor.handleSigterm()
 	process.on("SIGINT", interrupt)
 	process.on("SIGTERM", terminate)
 	try {
-		const child = Bun.spawn([binary, ...nativeArgs], {
+		const child = Bun.spawn(command, {
 			cwd: process.cwd(),
 			env,
 			stdin: "inherit",
