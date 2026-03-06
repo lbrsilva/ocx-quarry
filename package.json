@@ -29,6 +29,7 @@
 		"@commitlint/config-conventional": "^19.8.1",
 		"@commitlint/types": "^19.8.1",
 		"husky": "^9.1.7",
+		"pkg-pr-new": "0.0.65",
 		"turbo": "^2.8.7",
 		"typescript": "^5.9.3",
 		"wrangler": "^4.65.0"
