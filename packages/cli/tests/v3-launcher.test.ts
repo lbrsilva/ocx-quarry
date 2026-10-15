@@ -101,6 +101,12 @@ posix(
 		expect(output.stdout.trim()).toBe("selected")
 	},
 )
+posix("accepts forked opencode versions with a parenthesized build suffix", async () => {
+	await wrapper('console.log("launched")', "opencode v2.0.29-lbrsilva(1792064036)")
+	const output = await result([])
+	expect(output.code).toBe(0)
+	expect(output.stdout).toContain("launched")
+})
 posix("reports missing executable and missing profile without native fallback", async () => {
 	const missingBinary = await result([])
 	expect(missingBinary.code).not.toBe(0)

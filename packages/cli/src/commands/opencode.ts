@@ -153,7 +153,7 @@ export async function requireOpenCodeV2(
 			new Response(proc.stderr).text(),
 			proc.exited,
 		])
-		const match = /^\s*(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?\s*$/i.exec(output)
+		const match = /^\s*(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+]\S+)?\s*$/i.exec(output)
 		if (code !== 0 || !match)
 			throw new ConfigError(
 				`Cannot identify OpenCode at ${binary}: ${error.trim() || output.trim() || `exit ${code}`}`,
